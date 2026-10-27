@@ -37,6 +37,14 @@ pub const MaxBlocks: usize = 4000;
 pub const MaxEffectRows: usize = 400;
 /// Rows of blocks guessed for a level with no draft.
 const GuessRows: usize = 3;
+/// Length of the title card's reveal (D56). Every cell has settled by then.
+pub const RevealMs: u64 = 1000;
+/// How long one cell of the reveal takes to go from blocks to its glyph.
+const RevealFadeMs: u64 = 240;
+/// Largest per-cell delay added to the reveal's front.
+const RevealJitterMs: u64 = 100;
+/// Levels a cell of the reveal steps through ahead of the front, coarse to fine.
+pub const RevealLevels: u32 = 5;
 
 /// SplitMix64 finaliser.
 pub fn mix64(mut z: u64) -> u64 {
@@ -536,47 +544,186 @@ fn dissolve(
             }
             let p = now.saturating_sub(reveal) as f32 / CellFadeMs as f32;
             let h = hash(&[input.seed, row as u64, col as u64, now / 60]);
-            match fcell {
-                Some(final_cell_t::Glyph {
-                    text,
-                    width: w,
-                    style,
-                }) if p >= 0.6 => {
-                    let t = ((p - 0.6) / 0.4).clamp(0.0, 1.0);
-                    let fg = style.fg.unwrap_or(theme.fg);
-                    let color = if p >= 1.0 { fg } else { mix(theme.ice, fg, t) };
-                    let mut s = style.fg(color);
-                    if p < 1.0 {
-                        s = s.add_modifier(Modifier::BOLD);
-                    }
-                    line.push(text.clone(), s);
-                    col += (*w).max(1);
-                    continue;
-                }
-                Some(final_cell_t::Blank { style }) if p >= 0.6 => {
-                    line.push(" ", *style);
-                }
-                Some(final_cell_t::Covered) if p >= 0.6 => {
-                    // The glyph to the left was drawn when its own cell revealed. If its
-                    // front lagged this one, keep the column blank.
-                    line.push(" ", Style::new());
-                }
-                Some(final_cell_t::Glyph { .. }) | Some(final_cell_t::Covered) if p < 0.4 => {
-                    let dots = (4.0 - p * 7.0).round().max(1.0) as u32;
-                    let color = mix(theme.bg, theme.ice, 0.9 - p);
-                    line.push(braille(h, dots).to_string(), Style::new().fg(color));
-                }
-                Some(final_cell_t::Glyph { .. }) | Some(final_cell_t::Covered) if p < 0.6 => {
-                    if h.is_multiple_of(5) {
-                        let color = mix(theme.bg, theme.ice, 0.35);
-                        line.push(braille(h, 1).to_string(), Style::new().fg(color));
-                    } else {
-                        line.push(" ", Style::new());
-                    }
-                }
-                _ => line.push(" ", Style::new()),
+            col += fade_cell(&mut line, fcell, p, h, theme);
+        }
+        if let Some(fill) = final_lines.get(row).and_then(|l| l.fill) {
+            line.fill = Some(fill);
+        }
+        trim_trailing_blanks(&mut line);
+        lines.push(line);
+    }
+    effect_frame_t { lines, done: false }
+}
+
+/// Draw one cell that the front has reached, `p` of the way from blocks to its glyph (0 at the
+/// front, 1 settled): shrinking braille, then a sparse dot, then the glyph warming from ice to
+/// its own colour. Returns the columns used.
+fn fade_cell(
+    line: &mut line_t,
+    fcell: Option<&final_cell_t>,
+    p: f32,
+    h: u64,
+    theme: &theme_t,
+) -> usize {
+    match fcell {
+        Some(final_cell_t::Glyph { text, width, style }) if p >= 0.6 => {
+            let t = ((p - 0.6) / 0.4).clamp(0.0, 1.0);
+            let fg = style.fg.unwrap_or(theme.fg);
+            let color = if p >= 1.0 { fg } else { mix(theme.ice, fg, t) };
+            let mut s = style.fg(color);
+            if p < 1.0 {
+                s = s.add_modifier(Modifier::BOLD);
             }
+            line.push(text.clone(), s);
+            return (*width).max(1);
+        }
+        Some(final_cell_t::Blank { style }) if p >= 0.6 => {
+            line.push(" ", *style);
+        }
+        Some(final_cell_t::Covered) if p >= 0.6 => {
+            // The glyph to the left was drawn when its own cell revealed. If its front
+            // lagged this one, keep the column blank.
+            line.push(" ", Style::new());
+        }
+        Some(final_cell_t::Glyph { .. }) | Some(final_cell_t::Covered) if p < 0.4 => {
+            let dots = (4.0 - p * 7.0).round().max(1.0) as u32;
+            let color = mix(theme.bg, theme.ice, 0.9 - p);
+            line.push(braille(h, dots).to_string(), Style::new().fg(color));
+        }
+        Some(final_cell_t::Glyph { .. }) | Some(final_cell_t::Covered) if p < 0.6 => {
+            if h.is_multiple_of(5) {
+                let color = mix(theme.bg, theme.ice, 0.35);
+                line.push(braille(h, 1).to_string(), Style::new().fg(color));
+            } else {
+                line.push(" ", Style::new());
+            }
+        }
+        _ => line.push(" ", Style::new()),
+    }
+    1
+}
+
+/// Reveal fixed text from left to right with the reply effect's levels (D56). Ahead of the
+/// front a cell is a textured block whose level depends on how far the front still is: the
+/// farthest columns are level 0 and each level nearer the front is finer. In the first
+/// `coarse_cols` columns (a block-art logo) the coarse levels are solid blocks as wide as a
+/// whole glyph group and as tall as the text, narrowing to the glyph's own cells at the fine
+/// levels; beyond them (plain text) the blocks take the shape of the words, as a reply's do.
+/// The front then fades each cell to its glyph, as the dissolve does. The frame equals
+/// `final_lines` from `start_ms + RevealMs` on, and it always has as many rows as
+/// `final_lines`, so the text around it never moves.
+pub fn render_reveal(
+    final_lines: &[line_t],
+    coarse_cols: usize,
+    seed: u64,
+    start_ms: u64,
+    now: u64,
+    theme: &theme_t,
+) -> effect_frame_t {
+    if now >= start_ms.saturating_add(RevealMs) {
+        return effect_frame_t {
+            lines: final_lines.to_vec(),
+            done: true,
+        };
+    }
+    let target = final_grid(final_lines);
+    let rows = target.len();
+    let cols = target.iter().map(|r| r.len()).max().unwrap_or(0).max(1);
+    let inked = |row: usize, col: usize| {
+        matches!(
+            target.get(row).and_then(|r| r.get(col)),
+            Some(final_cell_t::Glyph { .. }) | Some(final_cell_t::Covered)
+        )
+    };
+    // Coarse blocks of the logo: runs of columns that hold ink in any row.
+    let coarse_cols = coarse_cols.min(cols);
+    let column_inked = |col: usize| (0..rows).any(|r| inked(r, col));
+    let mut groups: Vec<Option<(usize, usize, usize)>> = vec![None; cols];
+    let mut col = 0usize;
+    let mut block = 0usize;
+    while col < coarse_cols {
+        if column_inked(col) {
+            let start = col;
+            while col < coarse_cols && column_inked(col) {
+                col += 1;
+            }
+            for slot in groups.iter_mut().take(col).skip(start) {
+                *slot = Some((block, start, col - start));
+            }
+            block += 1;
+        } else {
             col += 1;
+        }
+    }
+    // Word blocks of the text: runs of inked cells within a row.
+    let mut words: Vec<Vec<Option<(usize, usize, usize)>>> = vec![vec![None; cols]; rows];
+    for (row, slots) in words.iter_mut().enumerate() {
+        let mut col = coarse_cols;
+        while col < cols {
+            if inked(row, col) {
+                let start = col;
+                while col < cols && inked(row, col) {
+                    col += 1;
+                }
+                for slot in slots.iter_mut().take(col).skip(start) {
+                    *slot = Some((block, start, col - start));
+                }
+                block += 1;
+            } else {
+                col += 1;
+            }
+        }
+    }
+    let front_ms = RevealMs - RevealFadeMs - RevealJitterMs;
+    let level_ms = (front_ms / u64::from(RevealLevels)).max(1);
+    let mut lines = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut line = line_t::blank();
+        let target_row = target.get(row);
+        let mut col = 0usize;
+        while col < cols {
+            let fcell = target_row.and_then(|r| r.get(col));
+            let u = front_position(row, col, rows, cols);
+            let jitter = hash(&[seed, row as u64, col as u64, 0x4C]) % RevealJitterMs;
+            let reveal = start_ms
+                .saturating_add((u * front_ms as f32) as u64)
+                .saturating_add(jitter);
+            if now < reveal {
+                let ahead = reveal - now;
+                let steps = (ahead / level_ms).min(u64::from(RevealLevels - 1)) as u32;
+                let level = RevealLevels - 1 - steps;
+                let shaped = match level {
+                    _ if col >= coarse_cols => inked(row, col),
+                    0 | 1 => groups.get(col).copied().flatten().is_some(),
+                    2 => inked(row, col) || inked(row, col.wrapping_sub(1)) || inked(row, col + 1),
+                    _ => inked(row, col),
+                };
+                let slot = if col < coarse_cols {
+                    groups.get(col).copied().flatten()
+                } else {
+                    words.get(row).and_then(|w| w.get(col)).copied().flatten()
+                };
+                let cell = slot
+                    .filter(|_| shaped)
+                    .map(|(block, start, width)| block_cell_t {
+                        block,
+                        index: col - start,
+                        width,
+                    });
+                match cell {
+                    Some(cell) => {
+                        let (symbol, color) =
+                            texture(seed, cell, Some(level), RevealLevels, now, theme);
+                        line.push(symbol.to_string(), Style::new().fg(color));
+                    }
+                    None => line.push(" ", Style::new()),
+                }
+                col += 1;
+                continue;
+            }
+            let p = (now - reveal) as f32 / RevealFadeMs as f32;
+            let h = hash(&[seed, row as u64, col as u64, now / 60]);
+            col += fade_cell(&mut line, fcell, p, h, theme);
         }
         if let Some(fill) = final_lines.get(row).and_then(|l| l.fill) {
             line.fill = Some(fill);
@@ -893,6 +1040,102 @@ mod tests {
         assert_eq!(dissolve_ms(0), DissolveMinMs);
         assert_eq!(dissolve_ms(100_000), DissolveMaxMs);
         assert!(dissolve_ms(250) > DissolveMinMs);
+    }
+
+    fn logo_lines(t: &theme_t) -> Vec<line_t> {
+        crate::banner::logo_rows()
+            .into_iter()
+            .map(|r| line_t::plain(format!("{r:<48}"), Style::new().fg(t.fg)))
+            .collect()
+    }
+
+    fn cols(line: &line_t, from: usize, to: usize) -> String {
+        line.text().chars().skip(from).take(to - from).collect()
+    }
+
+    #[test]
+    fn reveal_runs_coarse_on_the_right_and_sharp_on_the_left() {
+        let t = theme();
+        let lines = logo_lines(&t);
+        let start = 5_000u64;
+        let first = render_reveal(&lines, 48, 7, start, start, &t);
+        assert!(!first.done);
+        assert_eq!(first.lines.len(), lines.len());
+        assert_ne!(first.lines, lines);
+        // The last row holds ink only under the g. At the start the t's whole column group is
+        // still a coarse block there, while the n on the left is already down to its own
+        // (empty) cells.
+        let bottom = &first.lines[5];
+        assert!(
+            cols(bottom, 42, 48).chars().any(|c| c != ' '),
+            "{:?}",
+            bottom.text()
+        );
+        assert!(
+            cols(bottom, 0, 6).chars().all(|c| c == ' '),
+            "{:?}",
+            bottom.text()
+        );
+        assert!(cols(&lines[5], 42, 48).chars().all(|c| c == ' '));
+        // Half-way, the left letters are final and the right ones are not.
+        let mid = render_reveal(&lines, 48, 7, start, start + 450, &t);
+        assert_eq!(cols(&mid.lines[1], 0, 13), cols(&lines[1], 0, 13));
+        assert_ne!(mid.lines[1].text(), lines[1].text().trim_end());
+        // Every frame keeps the row count, and only draws effect glyphs or final glyphs in
+        // their final place.
+        let mut now = start;
+        while now < start + RevealMs {
+            let frame = render_reveal(&lines, 48, 7, start, now, &t);
+            assert_eq!(frame.lines.len(), lines.len());
+            for (row, line) in frame.lines.iter().enumerate() {
+                let want: Vec<char> = lines[row].text().chars().collect();
+                for (col, c) in line.text().chars().enumerate() {
+                    if !is_effect_glyph(c) && !matches!(c, '▀' | '▄') {
+                        assert_eq!(want.get(col), Some(&c), "row {row} col {col} at {now}");
+                    }
+                }
+            }
+            now += 29;
+        }
+    }
+
+    #[test]
+    fn reveal_shapes_text_beside_the_logo_as_words() {
+        let t = theme();
+        let mut lines = logo_lines(&t);
+        for line in lines.iter_mut() {
+            line.push("    model    demo", Style::new().fg(t.fg_dim));
+        }
+        let first = render_reveal(&lines, 48, 7, 0, 0, &t);
+        for line in &first.lines {
+            // Columns 57 to 60 are the gap between the two words: no block covers them.
+            let gap = cols(line, 57, 61);
+            assert!(gap.chars().all(|c| c == ' '), "{:?}", line.text());
+            // The words themselves are blocks, never letters.
+            assert!(
+                cols(line, 52, 57).chars().all(is_effect_glyph),
+                "{:?}",
+                line.text()
+            );
+        }
+        assert_eq!(render_reveal(&lines, 48, 7, 0, RevealMs, &t).lines, lines);
+    }
+
+    #[test]
+    fn reveal_ends_exactly_on_the_final_lines() {
+        let t = theme();
+        let lines = logo_lines(&t);
+        assert!(!render_reveal(&lines, 48, 7, 100, 100 + RevealMs - 1, &t).done);
+        let done = render_reveal(&lines, 48, 7, 100, 100 + RevealMs, &t);
+        assert!(done.done);
+        assert_eq!(done.lines, lines);
+        assert_eq!(render_reveal(&lines, 48, 7, 100, u64::MAX, &t).lines, lines);
+        // Deterministic for a seed and a clock.
+        assert_eq!(
+            render_reveal(&lines, 48, 7, 100, 420, &t),
+            render_reveal(&lines, 48, 7, 100, 420, &t)
+        );
+        assert!(render_reveal(&[], 48, 7, 0, 10, &t).lines.is_empty());
     }
 
     #[test]

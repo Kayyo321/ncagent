@@ -2,8 +2,9 @@
  * Ko, (Baczynski-Bruce) 2026; Apache 2.0
 */
 //! The right-hand column: the user's way around the UI. A new-chat button, the state of the
-//! current turn and call, the model, and the conversations grouped by project. Sections are a
-//! bold label over dim values, separated by space, never by lines.
+//! current turn and call, the model, and the conversations as a tree of folders (D54). Sections
+//! are a bold label over dim values, separated by space, never by lines. Nesting is shown by
+//! indentation and faint guide rails, and a move (drag or pick-up, D55) by tone steps.
 
 use harness::api::{SessionPhase, runtime_info_t};
 use ratatui::buffer::Buffer;
@@ -12,9 +13,11 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::banner::{chip, short_path};
 use crate::canvas::{fill, put_line, put_str, put_str_right};
-use crate::input::{Action, hit_registry_t};
+use crate::input::{Action, Target, hit_registry_t};
 use crate::strip::strip_line;
-use crate::text::{format_ms, group_digits, line_t, sanitize, truncate};
+use crate::text::{
+    clusters, format_ms, group_digits, line_t, sanitize, str_width, truncate, wrap_plain,
+};
 use crate::theme::{mix, theme_t};
 use crate::view_model::transcript_t;
 
@@ -28,8 +31,31 @@ pub enum Activity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SidebarItemKind {
     NewChat,
-    Project { name: String, collapsed: bool },
-    Session { id: String },
+    /// The "conversations" label: the top level of the tree, and a drop target (D55).
+    Root,
+    Folder {
+        id: String,
+        collapsed: bool,
+    },
+    Session {
+        id: String,
+    },
+}
+
+/// How a row shows while a conversation or folder is being moved (D55).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MoveMark {
+    None,
+    /// The row being moved.
+    Source,
+    /// A destination the move may use.
+    Allowed,
+    /// A destination the move may not use, with a short reason.
+    Refused {
+        reason: String,
+    },
+    /// Not a destination: a conversation row while something moves.
+    Inert,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +66,43 @@ pub struct sidebar_item_t {
     pub active: bool,
     pub activity: Activity,
     pub demo: bool,
+    /// Nesting level in the tree: 0 for top-level folders and unfiled conversations.
+    pub depth: usize,
+    pub mark: MoveMark,
+}
+
+impl sidebar_item_t {
+    /// A row of the scrolled tree (not the new-chat button or the "conversations" label).
+    pub fn in_tree(&self) -> bool {
+        matches!(
+            self.kind,
+            SidebarItemKind::Folder { .. } | SidebarItemKind::Session { .. }
+        )
+    }
+}
+
+/// Rows the sidebar inserts into the tree: the folder-name prompt or the delete confirmation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverlayKind {
+    Prompt {
+        caption: String,
+        text: String,
+        /// Byte offset of the cursor in `text`.
+        cursor: usize,
+    },
+    Confirm {
+        name: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct overlay_t {
+    pub kind: OverlayKind,
+    /// The item the rows follow. `None` puts them at the top of the tree.
+    pub anchor: Option<usize>,
+    /// The rows take the place of the anchor row (a rename).
+    pub replace: bool,
+    pub depth: usize,
 }
 
 pub struct sidebar_input_t<'a> {
@@ -55,6 +118,23 @@ pub struct sidebar_input_t<'a> {
     pub animate: bool,
     pub hover: Option<(u16, u16)>,
     pub drawer: bool,
+    /// Keep the selected row in view. Off while a drag scrolls the tree.
+    pub follow: bool,
+    /// The destination a move would use now: the row under the pointer or the pick-up choice.
+    pub hot: Option<usize>,
+    /// The title being dragged, shown as a ghost label at the pointer.
+    pub ghost: Option<String>,
+    pub overlay: Option<&'a overlay_t>,
+    /// Show the row chips (new sub-folder, rename, move, delete) on the hovered or selected row.
+    pub chips: bool,
+}
+
+/// What drawing the sidebar decided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct sidebar_out_t {
+    pub scroll: usize,
+    /// The rows of the tree, for drag auto-scroll.
+    pub list: Rect,
 }
 
 struct srow_t {
@@ -294,16 +374,192 @@ fn sections(input: &sidebar_input_t<'_>, inner: usize, theme: &theme_t) -> Vec<(
     out
 }
 
-/// Draw the sidebar into `area`. Returns the conversation scroll offset it used.
+/// One row of the drawn tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum disp_t {
+    Item(usize),
+    Overlay(usize),
+}
+
+/// One row of an overlay: the text, its tone, an optional rail, and clickable spans as
+/// (column offset, width, action).
+struct overlay_row_t {
+    line: line_t,
+    bg: Color,
+    rail: Option<Color>,
+    buttons: Vec<(u16, u16, Action)>,
+}
+
+/// The tone of a destination under the pointer or the pick-up choice.
+fn hot_bg(bg: Color, theme: &theme_t) -> Color {
+    mix(bg, theme.agent, 0.24)
+}
+
+fn refused_bg(bg: Color, theme: &theme_t) -> Color {
+    mix(bg, theme.error, 0.18)
+}
+
+fn confirm_bg(bg: Color, theme: &theme_t) -> Color {
+    mix(bg, theme.error, 0.12)
+}
+
+/// The end of `text` that fits `width` columns.
+fn tail(text: &str, width: usize) -> String {
+    let mut used = 0usize;
+    let mut start = text.len();
+    for c in clusters(text).iter().rev() {
+        if used + c.width > width {
+            break;
+        }
+        used += c.width;
+        start = c.start;
+    }
+    text.get(start..).unwrap_or("").to_string()
+}
+
+/// A one-line editor: the text around a block cursor, scrolled so the cursor stays in view.
+fn prompt_line(text: &str, cursor: usize, width: usize, bg: Color, theme: &theme_t) -> line_t {
+    let cursor = cursor.min(text.len());
+    let before = sanitize(text.get(..cursor).unwrap_or(""), false);
+    let after = sanitize(text.get(cursor..).unwrap_or(""), false);
+    let first = clusters(&after).first().map(|c| (c.start, c.end));
+    let (under, rest) = match first {
+        Some((a, b)) => (
+            after.get(a..b).unwrap_or(" ").to_string(),
+            after.get(b..).unwrap_or("").to_string(),
+        ),
+        None => (" ".to_string(), String::new()),
+    };
+    let room = width.saturating_sub(str_width(&under));
+    let shown = tail(&before, room);
+    let left = room.saturating_sub(str_width(&shown));
+    let style = Style::new().fg(theme.fg).bg(bg);
+    let mut line = line_t::plain(shown, style);
+    line.push(under, Style::new().fg(theme.bg).bg(theme.ice));
+    if left > 0 {
+        line.push(truncate(&rest, left), style);
+    }
+    line
+}
+
+fn overlay_rows(
+    overlay: &overlay_t,
+    width: usize,
+    bg: Color,
+    theme: &theme_t,
+) -> Vec<overlay_row_t> {
+    let width = width.max(4);
+    match &overlay.kind {
+        OverlayKind::Prompt {
+            caption,
+            text,
+            cursor,
+        } => {
+            let caption = line_t::plain(
+                truncate(caption, width),
+                Style::new().fg(theme.fg_dim).add_modifier(Modifier::ITALIC),
+            );
+            let field = theme.inset;
+            let mut input = line_t::plain("▸ ", Style::new().fg(theme.ice).bg(field));
+            for span in prompt_line(text, *cursor, width.saturating_sub(2), field, theme).spans {
+                input.push(span.text, span.style);
+            }
+            vec![
+                overlay_row_t {
+                    line: caption,
+                    bg,
+                    rail: None,
+                    buttons: Vec::new(),
+                },
+                overlay_row_t {
+                    line: input,
+                    bg: field,
+                    rail: Some(theme.ice),
+                    buttons: Vec::new(),
+                },
+            ]
+        }
+        OverlayKind::Confirm { name } => {
+            let tone = confirm_bg(bg, theme);
+            let mut rows: Vec<overlay_row_t> = wrap_plain(
+                &format!("delete folder “{name}”? its contents move up"),
+                width,
+                Style::new().fg(theme.fg),
+            )
+            .into_iter()
+            .take(3)
+            .map(|line| overlay_row_t {
+                line,
+                bg: tone,
+                rail: Some(theme.error),
+                buttons: Vec::new(),
+            })
+            .collect();
+            let yes = " enter confirm ";
+            let no = " esc cancel ";
+            let mut line = line_t::plain(
+                yes,
+                Style::new()
+                    .fg(theme.bg)
+                    .bg(theme.error)
+                    .add_modifier(Modifier::BOLD),
+            );
+            line.push(" ", Style::new());
+            line.push(no, Style::new().fg(theme.fg).bg(theme.inset));
+            let yes_w = str_width(yes) as u16;
+            let no_w = str_width(no) as u16;
+            rows.push(overlay_row_t {
+                line,
+                bg: tone,
+                rail: Some(theme.error),
+                buttons: vec![
+                    (0, yes_w, Action::ConfirmYes),
+                    (yes_w + 1, no_w, Action::SidebarCancel),
+                ],
+            });
+            rows
+        }
+    }
+}
+
+/// The tree as drawn rows: every item but the button and the label, with the overlay rows
+/// placed after (or instead of) their anchor.
+fn tree_rows(input: &sidebar_input_t<'_>, overlay_len: usize) -> Vec<disp_t> {
+    let mut out = Vec::with_capacity(input.items.len() + overlay_len);
+    let overlay = input.overlay;
+    if overlay.is_some_and(|o| o.anchor.is_none()) {
+        out.extend((0..overlay_len).map(disp_t::Overlay));
+    }
+    for (index, item) in input.items.iter().enumerate() {
+        if !item.in_tree() {
+            continue;
+        }
+        let anchored = overlay.is_some_and(|o| o.anchor == Some(index));
+        let replaced = anchored && overlay.is_some_and(|o| o.replace);
+        if !replaced {
+            out.push(disp_t::Item(index));
+        }
+        if anchored {
+            out.extend((0..overlay_len).map(disp_t::Overlay));
+        }
+    }
+    out
+}
+
+/// Draw the sidebar into `area`.
 pub fn draw_sidebar(
     buf: &mut Buffer,
     area: Rect,
     input: &sidebar_input_t<'_>,
     theme: &theme_t,
     hits: &mut hit_registry_t,
-) -> usize {
+) -> sidebar_out_t {
+    let mut out = sidebar_out_t {
+        scroll: input.scroll,
+        list: Rect::default(),
+    };
     if area.width < 8 || area.height < 4 {
-        return input.scroll;
+        return out;
     }
     let bg = if input.drawer { theme.dock } else { theme.side };
     fill(buf, area, Style::new().bg(bg).fg(theme.fg));
@@ -428,71 +684,79 @@ pub fn draw_sidebar(
     }
 
     // Conversations.
-    let mut scroll = input.scroll;
     if y < footer_y {
-        put_line(buf, x0, y, x1, &label("conversations", theme), base);
+        let ctx = tree_ctx_t {
+            area,
+            bg,
+            input,
+            moving: input.items.iter().any(|i| i.mark != MoveMark::None),
+            theme,
+        };
+        draw_root(buf, &ctx, y, hits);
         y = y.saturating_add(1);
-        let list: Vec<(usize, &sidebar_item_t)> = input
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| !matches!(i.kind, SidebarItemKind::NewChat))
-            .collect();
+        let overlay = input
+            .overlay
+            .map(|o| {
+                let indent = (o.depth * 2) as u16;
+                let width = x1.saturating_sub(x0.saturating_add(indent)) as usize;
+                overlay_rows(o, width, bg, theme)
+            })
+            .unwrap_or_default();
+        let rows_list = tree_rows(input, overlay.len());
         let rows = footer_y.saturating_sub(y).saturating_sub(1) as usize;
+        out.list = Rect::new(area.x, y, area.width, rows as u16);
         if rows > 0 {
-            if let Some(pos) = list.iter().position(|(i, _)| *i == input.selected) {
-                if pos < scroll {
-                    scroll = pos;
-                } else if pos >= scroll + rows {
-                    scroll = pos + 1 - rows;
+            let want = if overlay.is_empty() {
+                input
+                    .follow
+                    .then(|| {
+                        rows_list
+                            .iter()
+                            .position(|d| *d == disp_t::Item(input.selected))
+                    })
+                    .flatten()
+                    .map(|p| (p, p))
+            } else {
+                let first = rows_list
+                    .iter()
+                    .position(|d| matches!(d, disp_t::Overlay(_)));
+                let last = rows_list
+                    .iter()
+                    .rposition(|d| matches!(d, disp_t::Overlay(_)));
+                first.zip(last)
+            };
+            let mut scroll = input.scroll;
+            if let Some((lo, hi)) = want {
+                if lo < scroll {
+                    scroll = lo;
+                } else if hi >= scroll + rows {
+                    scroll = (hi + 1).saturating_sub(rows).min(lo);
                 }
             }
-            scroll = scroll.min(list.len().saturating_sub(rows));
-            for (index, item) in list.iter().skip(scroll).take(rows) {
-                let rect = Rect::new(area.x, y, area.width, 1);
-                let selected = input.focused && *index == input.selected;
-                let hovered = input
-                    .hover
-                    .is_some_and(|(hx, hy)| rect.contains(Position::new(hx, hy)));
-                let row_bg = if item.active {
-                    theme.select
-                } else if selected || hovered {
-                    theme.hover
-                } else {
-                    bg
-                };
-                fill(buf, rect, Style::new().bg(row_bg));
-                let st = Style::new().bg(row_bg);
-                if item.active {
-                    put_str(buf, area.x, y, area.right(), "▌", st.fg(theme.agent));
+            scroll = scroll.min(rows_list.len().saturating_sub(rows));
+            out.scroll = scroll;
+            for d in rows_list.iter().skip(scroll).take(rows) {
+                match *d {
+                    disp_t::Item(index) => {
+                        if let Some(item) = input.items.get(index) {
+                            draw_tree_row(buf, &ctx, y, index, item, hits);
+                        }
+                    }
+                    disp_t::Overlay(k) => {
+                        if let (Some(row), Some(o)) = (overlay.get(k), input.overlay) {
+                            draw_overlay_row(buf, area, y, row, o.depth, theme, hits);
+                        }
+                    }
                 }
-                if selected {
-                    put_str(
-                        buf,
-                        area.x.saturating_add(1),
-                        y,
-                        area.right(),
-                        "›",
-                        st.fg(theme.ice),
-                    );
-                }
-                let pulse = if input.animate {
-                    (input.clock as f32 / 300.0).sin() * 0.5 + 0.5
-                } else {
-                    1.0
-                };
-                let text_row = Rect::new(x0, y, x1.saturating_sub(x0), 1);
-                draw_item(buf, text_row, item, st, theme, pulse);
-                hits.add(rect, Action::SidebarActivateAt(*index));
                 y = y.saturating_add(1);
             }
-            if list.len() > scroll + rows {
+            if rows_list.len() > scroll + rows {
                 put_str(
                     buf,
                     x0,
                     y,
                     x1,
-                    &format!("↓ {} more", list.len() - scroll - rows),
+                    &format!("↓ {} more", rows_list.len() - scroll - rows),
                     base.fg(theme.fg_faint),
                 );
             }
@@ -506,7 +770,7 @@ pub fn draw_sidebar(
         Some((d, l)) => (format!("{d}/"), l.to_string()),
         None => (String::new(), cwd.clone()),
     };
-    let last_w = crate::text::str_width(&last).min(inner);
+    let last_w = str_width(&last).min(inner);
     let dir_short = short_path(&dir, inner.saturating_sub(last_w));
     let nx = put_str(buf, x0, fy, x1, &dir_short, base.fg(theme.fg_faint));
     put_str(
@@ -534,80 +798,412 @@ pub fn draw_sidebar(
         &version,
         base.fg(theme.fg_faint),
     );
-    scroll
+
+    // The ghost of a dragged row follows the pointer, one row below it so the destination
+    // stays readable.
+    if let (Some(title), Some((px, py))) = (&input.ghost, input.hover)
+        && area.contains(Position::new(px, py))
+    {
+        let text = format!(
+            " ⇢ {} ",
+            truncate(title, usize::from(area.width).saturating_sub(8))
+        );
+        let w = str_width(&text) as u16;
+        let gy = if py.saturating_add(1) < area.bottom() {
+            py.saturating_add(1)
+        } else {
+            py.saturating_sub(1)
+        };
+        let gx = px
+            .saturating_add(2)
+            .min(area.right().saturating_sub(w))
+            .max(area.x);
+        put_str(
+            buf,
+            gx,
+            gy,
+            area.right(),
+            &text,
+            Style::new()
+                .fg(theme.fg)
+                .bg(theme.select)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+    out
 }
 
-/// Draw one conversation-list row into `row` (the padded text columns). `pulse` is the
-/// brightness of a generating session's dot.
-fn draw_item(
+/// What every row of the tree draws against.
+struct tree_ctx_t<'a, 'b> {
+    area: Rect,
+    bg: Color,
+    input: &'a sidebar_input_t<'b>,
+    /// A move is in progress, so rows show their move marks instead of chips.
+    moving: bool,
+    theme: &'a theme_t,
+}
+
+/// The "conversations" label: the top level of the tree. It holds the new-folder button, and
+/// during a move it is the destination "top level".
+fn draw_root(buf: &mut Buffer, ctx: &tree_ctx_t<'_, '_>, y: u16, hits: &mut hit_registry_t) {
+    let (area, bg, input, moving, theme) = (ctx.area, ctx.bg, ctx.input, ctx.moving, ctx.theme);
+    let x0 = area.x.saturating_add(2);
+    let x1 = area.right().saturating_sub(2);
+    let rect = Rect::new(area.x, y, area.width, 1);
+    let index = input
+        .items
+        .iter()
+        .position(|i| i.kind == SidebarItemKind::Root);
+    let item = index.and_then(|i| input.items.get(i));
+    let hot = index.is_some() && input.hot == index;
+    let refused = item.is_some_and(|i| matches!(i.mark, MoveMark::Refused { .. }));
+    let row_bg = match (hot, refused) {
+        (true, false) => hot_bg(bg, theme),
+        (true, true) => refused_bg(bg, theme),
+        _ => bg,
+    };
+    fill(buf, rect, Style::new().bg(row_bg));
+    let st = Style::new().bg(row_bg);
+    if hot {
+        let rail = if refused { theme.error } else { theme.ice };
+        put_str(buf, area.x, y, area.right(), "▌", st.fg(rail));
+    }
+    let label_fg = if moving && refused && !hot {
+        theme.fg_faint
+    } else {
+        theme.fg
+    };
+    let after = put_str(
+        buf,
+        x0,
+        y,
+        x1,
+        "conversations",
+        st.fg(label_fg).add_modifier(Modifier::BOLD),
+    );
+    if let Some(i) = index {
+        hits.add_target(rect, Target::Row(i));
+    }
+    if moving {
+        let (text, fg) = match item.map(|i| &i.mark) {
+            Some(MoveMark::Refused { reason }) => (reason.clone(), theme.error),
+            _ if hot => ("↑ top level".to_string(), theme.ice),
+            _ => ("↑ top level".to_string(), theme.fg_faint),
+        };
+        put_str_right(buf, x1, y, after.saturating_add(1), &text, st.fg(fg));
+        return;
+    }
+    // The new-folder button.
+    let label = " + folder ";
+    let w = str_width(label) as u16;
+    let bx = x1.saturating_sub(w);
+    if bx > after {
+        let button = Rect::new(bx, y, w, 1);
+        let over = input
+            .hover
+            .is_some_and(|(hx, hy)| button.contains(Position::new(hx, hy)));
+        let chip_bg = if over { theme.select } else { theme.inset };
+        let nx = put_str(
+            buf,
+            bx,
+            y,
+            x1,
+            " +",
+            Style::new()
+                .fg(theme.ice)
+                .bg(chip_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+        put_str(
+            buf,
+            nx,
+            y,
+            x1,
+            " folder ",
+            Style::new()
+                .fg(if over { theme.fg } else { theme.fg_dim })
+                .bg(chip_bg),
+        );
+        hits.add(button, Action::NewFolder);
+    }
+}
+
+fn draw_overlay_row(
     buf: &mut Buffer,
-    row: Rect,
-    item: &sidebar_item_t,
-    st: Style,
+    area: Rect,
+    y: u16,
+    row: &overlay_row_t,
+    depth: usize,
     theme: &theme_t,
-    pulse: f32,
+    hits: &mut hit_registry_t,
 ) {
-    let (x0, y, x1) = (row.x, row.y, row.right());
+    let x0 = area.x.saturating_add(2);
+    let x1 = area.right().saturating_sub(2);
+    let rect = Rect::new(area.x, y, area.width, 1);
+    fill(buf, rect, Style::new().bg(row.bg));
+    let st = Style::new().bg(row.bg);
+    if let Some(rail) = row.rail {
+        put_str(buf, area.x, y, area.right(), "▌", st.fg(rail));
+    }
+    let guide = mix(row.bg, theme.fg_faint, 0.7);
+    for k in 0..depth {
+        put_str(
+            buf,
+            x0.saturating_add((k * 2) as u16),
+            y,
+            x1,
+            "▏",
+            st.fg(guide),
+        );
+    }
+    let x = x0.saturating_add((depth * 2) as u16);
+    put_line(buf, x, y, x1, &row.line, st);
+    for (col, width, action) in &row.buttons {
+        let r = Rect::new(x.saturating_add(*col), y, *width, 1).intersection(rect);
+        hits.add(r, action.clone());
+    }
+}
+
+/// The chips a row offers on hover or selection, as (glyph, action).
+fn row_chips(index: usize, item: &sidebar_item_t) -> Vec<(&'static str, Action)> {
     match &item.kind {
-        SidebarItemKind::NewChat => {}
-        SidebarItemKind::Project { collapsed, .. } => {
-            let arrow = if *collapsed { "▸ " } else { "▾ " };
-            let nx = put_str(buf, x0, y, x1, arrow, st.fg(theme.fg_faint));
+        SidebarItemKind::Folder { .. } => {
+            let mut chips = Vec::with_capacity(4);
+            // A top-level folder is level 1, so a folder at depth d is level d + 1.
+            if item.depth + 1 < harness::organize::MaxFolderDepth {
+                chips.push(("+", Action::NewSubfolderAt(index)));
+            }
+            chips.push(("✎", Action::RenameFolderAt(index)));
+            chips.push(("⇢", Action::PickUpAt(index)));
+            chips.push(("✕", Action::DeleteFolderAt(index)));
+            chips
+        }
+        SidebarItemKind::Session { .. } => vec![("⇢", Action::PickUpAt(index))],
+        _ => Vec::new(),
+    }
+}
+
+/// Draw one row of the tree: a folder or a conversation.
+fn draw_tree_row(
+    buf: &mut Buffer,
+    ctx: &tree_ctx_t<'_, '_>,
+    y: u16,
+    index: usize,
+    item: &sidebar_item_t,
+    hits: &mut hit_registry_t,
+) {
+    let (area, bg, input, moving, theme) = (ctx.area, ctx.bg, ctx.input, ctx.moving, ctx.theme);
+    let x0 = area.x.saturating_add(2);
+    let x1 = area.right().saturating_sub(2);
+    let rect = Rect::new(area.x, y, area.width, 1);
+    let selected = input.focused && index == input.selected;
+    let hovered = input
+        .hover
+        .is_some_and(|(hx, hy)| rect.contains(Position::new(hx, hy)));
+    let hot = input.hot == Some(index);
+    let refused = matches!(item.mark, MoveMark::Refused { .. });
+    let row_bg = if hot && refused {
+        refused_bg(bg, theme)
+    } else if hot {
+        hot_bg(bg, theme)
+    } else if item.mark == MoveMark::Source {
+        theme.inset
+    } else if item.active {
+        theme.select
+    } else if (selected || hovered) && !moving {
+        theme.hover
+    } else {
+        bg
+    };
+    fill(buf, rect, Style::new().bg(row_bg));
+    let st = Style::new().bg(row_bg);
+    if hot {
+        let rail = if refused { theme.error } else { theme.ice };
+        put_str(buf, area.x, y, area.right(), "▌", st.fg(rail));
+    } else if item.active {
+        put_str(buf, area.x, y, area.right(), "▌", st.fg(theme.agent));
+    }
+    if selected && !moving {
+        put_str(
+            buf,
+            area.x.saturating_add(1),
+            y,
+            area.right(),
+            "›",
+            st.fg(theme.ice),
+        );
+    }
+    let guide = mix(row_bg, theme.fg_faint, 0.7);
+    for k in 0..item.depth {
+        put_str(
+            buf,
+            x0.saturating_add((k * 2) as u16),
+            y,
+            x1,
+            "▏",
+            st.fg(guide),
+        );
+    }
+    hits.add_target(rect, Target::Row(index));
+
+    // Right side: the chips, a move hint, or the detail.
+    let show_chips = input.chips && !moving && (hovered || selected);
+    let mut right_start = x1;
+    if show_chips {
+        let chips = row_chips(index, item);
+        let mut cx = x1;
+        let mut placed = Vec::with_capacity(chips.len());
+        for (glyph, action) in chips.iter().rev() {
+            cx = cx.saturating_sub(3);
+            placed.push((cx, *glyph, action.clone()));
+        }
+        let floor = x0.saturating_add((item.depth * 2 + 6) as u16);
+        if cx >= floor {
+            for (cx, glyph, action) in placed {
+                let chip_rect = Rect::new(cx, y, 3, 1);
+                let over = input
+                    .hover
+                    .is_some_and(|(hx, hy)| chip_rect.contains(Position::new(hx, hy)));
+                let (fg, chip_bg) = match (over, glyph) {
+                    (true, "✕") => (theme.error, theme.select),
+                    (true, _) => (theme.fg, theme.select),
+                    (false, _) => (theme.fg_dim, theme.inset),
+                };
+                put_str(
+                    buf,
+                    cx,
+                    y,
+                    x1,
+                    &format!(" {glyph} "),
+                    Style::new().fg(fg).bg(chip_bg),
+                );
+                hits.add(chip_rect, action);
+            }
+            right_start = cx;
+        }
+    }
+    let pulse = if input.animate {
+        (input.clock as f32 / 300.0).sin() * 0.5 + 0.5
+    } else {
+        1.0
+    };
+    let text_x = match item.kind {
+        SidebarItemKind::Folder { .. } => x0.saturating_add((item.depth * 2) as u16),
+        _ => x0.saturating_add((item.depth * 2 + 2) as u16),
+    };
+    match &item.kind {
+        SidebarItemKind::Folder { collapsed, .. } => {
+            let (arrow, arrow_fg) = if item.mark == MoveMark::Source {
+                ("⇢ ", theme.ice)
+            } else if *collapsed {
+                ("▸ ", theme.fg_faint)
+            } else {
+                ("▾ ", theme.fg_faint)
+            };
+            let nx = put_str(buf, text_x, y, x1, arrow, st.fg(arrow_fg));
+            let name_fg = match &item.mark {
+                MoveMark::Refused { .. } if hot => theme.error,
+                MoveMark::Refused { .. } | MoveMark::Source => theme.fg_faint,
+                _ if hot || selected || hovered => theme.fg,
+                _ => theme.fg_dim,
+            };
+            let right = if show_chips && right_start < x1 {
+                None
+            } else {
+                Some(folder_right(item, hot, collapsed, theme, pulse))
+            };
+            let right_w = right.as_ref().map(|r| r.width() as u16).unwrap_or(0);
+            let end = right_start.min(x1.saturating_sub(right_w + u16::from(right_w > 0)));
+            let name = truncate(&item.title, end.saturating_sub(nx) as usize);
             put_str(
                 buf,
                 nx,
                 y,
-                x1.saturating_sub(4),
-                &item.title,
-                st.fg(theme.fg_dim).add_modifier(Modifier::BOLD),
+                end,
+                &name,
+                st.fg(name_fg).add_modifier(Modifier::BOLD),
             );
-            put_str_right(buf, x1, y, x0, &item.detail, st.fg(theme.fg_faint));
+            if let Some(r) = right {
+                put_line(buf, x1.saturating_sub(right_w).max(nx), y, x1, &r, st);
+            }
         }
         SidebarItemKind::Session { .. } => {
-            let detail_w = crate::text::str_width(&item.detail) as u16;
-            let tag_w: u16 = if item.demo { 5 } else { 0 };
+            if item.mark == MoveMark::Source {
+                put_str(buf, text_x.saturating_sub(2), y, x1, "⇢", st.fg(theme.ice));
+            }
+            let detail_w = if show_chips && right_start < x1 {
+                0
+            } else {
+                str_width(&item.detail) as u16
+            };
+            let tag_w: u16 = if item.demo && detail_w > 0 { 5 } else { 0 };
             let dot_w: u16 = if item.activity == Activity::Idle {
                 0
             } else {
                 2
             };
-            let title_end = x1.saturating_sub(detail_w + tag_w + dot_w + 1);
-            let x = x0.saturating_add(2);
-            let title_style = if item.active {
-                st.fg(theme.fg).add_modifier(Modifier::BOLD)
-            } else {
-                st.fg(theme.fg_dim)
+            let title_end = right_start
+                .min(x1)
+                .saturating_sub(detail_w + tag_w + dot_w + 1);
+            let title_style = match item.mark {
+                MoveMark::Inert | MoveMark::Source => st.fg(theme.fg_faint),
+                _ if item.active => st.fg(theme.fg).add_modifier(Modifier::BOLD),
+                _ => st.fg(theme.fg_dim),
             };
-            let title = truncate(&item.title, title_end.saturating_sub(x) as usize);
-            put_str(buf, x, y, title_end, &title, title_style);
-            let mut rx = x1;
-            rx = put_str_right(buf, rx, y, x0, &item.detail, st.fg(theme.fg_faint));
-            if item.demo {
-                rx = put_str_right(
-                    buf,
-                    rx,
-                    y,
-                    x0,
-                    "demo ",
-                    st.fg(mix(theme.side, theme.approval, 0.6)),
-                );
-            }
-            match item.activity {
-                Activity::Idle => {}
-                Activity::Generating => {
-                    put_str_right(
+            let title = truncate(&item.title, title_end.saturating_sub(text_x) as usize);
+            put_str(buf, text_x, y, title_end, &title, title_style);
+            let mut rx = right_start.min(x1);
+            if detail_w > 0 {
+                rx = put_str_right(buf, rx, y, x0, &item.detail, st.fg(theme.fg_faint));
+                if item.demo {
+                    rx = put_str_right(
                         buf,
                         rx,
                         y,
                         x0,
-                        "● ",
-                        st.fg(mix(theme.ice_deep, theme.ice, pulse)),
+                        "demo ",
+                        st.fg(mix(theme.side, theme.approval, 0.6)),
                     );
                 }
-                Activity::Waiting => {
-                    put_str_right(buf, rx, y, x0, "● ", st.fg(theme.approval));
-                }
+            }
+            if let Some((dot, color)) = activity_dot(item.activity, theme, pulse) {
+                put_str_right(buf, rx, y, x0, dot, st.fg(color));
             }
         }
+        SidebarItemKind::NewChat | SidebarItemKind::Root => {}
+    }
+}
+
+/// The right side of a folder row: the reason a move is refused, a drop hint, or the count of
+/// conversations inside (and a dot when a folded folder holds a working conversation).
+fn folder_right(
+    item: &sidebar_item_t,
+    hot: bool,
+    collapsed: &bool,
+    theme: &theme_t,
+    pulse: f32,
+) -> line_t {
+    match &item.mark {
+        MoveMark::Refused { reason } if hot => {
+            line_t::plain(reason.clone(), Style::new().fg(theme.error))
+        }
+        MoveMark::Allowed if hot => line_t::plain("move here", Style::new().fg(theme.ice)),
+        _ => {
+            let mut line = line_t::blank();
+            if *collapsed && let Some((dot, color)) = activity_dot(item.activity, theme, pulse) {
+                line.push(dot, Style::new().fg(color));
+            }
+            line.push(item.detail.clone(), Style::new().fg(theme.fg_faint));
+            line
+        }
+    }
+}
+
+/// The dot of a working conversation: pulsing ice while it generates, amber while it waits.
+fn activity_dot(activity: Activity, theme: &theme_t, pulse: f32) -> Option<(&'static str, Color)> {
+    match activity {
+        Activity::Idle => None,
+        Activity::Generating => Some(("● ", mix(theme.ice_deep, theme.ice, pulse))),
+        Activity::Waiting => Some(("● ", theme.approval)),
     }
 }

@@ -10,6 +10,7 @@
 
 pub mod backend;
 pub mod codec;
+pub mod organize;
 pub mod paths;
 pub mod profile;
 pub mod scenario;

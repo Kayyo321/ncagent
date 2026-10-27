@@ -12,7 +12,7 @@ use harness::approval::{ApprovalDecision, ApprovalMode, ApprovalSource};
 use harness::event::{CancelScope, NoticeLevel, TurnOutcome};
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::banner::{card_input_t, chip, title_card};
+use crate::banner::{LogoRows, LogoWidth, card_input_t, chip, logo_shown, title_card};
 use crate::effect::{self, effect_input_t, level_input_t};
 use crate::input::Action;
 use crate::markdown;
@@ -60,7 +60,12 @@ pub struct render_ctx_t<'a> {
     pub clock: u64,
     pub animate: bool,
     pub info: &'a runtime_info_t,
+    /// App-clock time the title card's logo reveal started (D56), while it plays.
+    pub logo_start: Option<u64>,
 }
+
+/// Seed of the logo reveal's textures, so every launch draws the same frames.
+const LogoSeed: u64 = 0x6E63_6167;
 
 fn header(left: Vec<span_t>, right: Vec<span_t>, width: usize) -> line_t {
     let lw = spans_width(&left);
@@ -125,12 +130,24 @@ pub fn render_block(
                 meta: transcript.meta.as_ref(),
                 mode,
             };
+            let mut card = title_card(&card, w, theme);
+            let mut live = false;
+            if let Some(start) = ctx.logo_start
+                && ctx.animate
+                && logo_shown(w)
+            {
+                let n = LogoRows.min(card.len());
+                let frame =
+                    effect::render_reveal(&card[..n], LogoWidth, LogoSeed, start, ctx.clock, theme);
+                live = !frame.done;
+                card.splice(..n, frame.lines);
+            }
             let mut lines = vec![line_t::blank()];
-            lines.extend(title_card(&card, w, theme));
+            lines.extend(card);
             block_rows_t {
                 rows: rows_from(lines, None, None, None),
                 sticky: None,
-                live: false,
+                live,
             }
         }
         BlockKind::User { text, from_queue } => {

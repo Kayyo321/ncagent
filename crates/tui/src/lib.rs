@@ -25,6 +25,7 @@ pub mod composer;
 pub mod draw;
 pub mod effect;
 pub mod event_loop;
+pub mod folders;
 pub mod help;
 pub mod input;
 pub mod layout;
@@ -42,6 +43,8 @@ pub mod scripted;
 
 #[cfg(test)]
 mod app_tests;
+#[cfg(test)]
+mod folder_tests;
 
 pub use theme::ColorMode;
 

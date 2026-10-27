@@ -6,24 +6,26 @@
 //! ratatui `Frame` (see `draw`), and bytes for the terminal (OSC 52) are queued in `outputs`
 //! for the loop to write.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use harness::api::{SessionPhase, runtime_info_t, runtime_t, session_t};
 use harness::approval::{ApprovalDecision, ApprovalMode};
 use harness::event::SessionEvent;
+use harness::organize::organization_t;
 use harness::store::session_summary_t;
 use ratatui::layout::Rect;
 
 use crate::clipboard::osc52;
 use crate::commands::{self, Command};
 use crate::composer::{EditOp, composer_t};
+use crate::folders::{MoveSource, grab_t, prompt_t};
 use crate::input::{
     Action, Focus, Modal, MouseIntent, hit_registry_t, key_ctx_t, map_key, map_mouse,
 };
 use crate::layout::{DockWidth, SidebarMode, layout_t};
-use crate::sidebar::{Activity, SidebarItemKind, sidebar_item_t};
+use crate::sidebar::{Activity, MoveMark, SidebarItemKind, sidebar_item_t};
 use crate::text::{format_age, sanitize, truncate};
 use crate::theme::{ColorMode, theme_t};
 use crate::transcript::transcript_view_t;
@@ -136,6 +138,9 @@ pub struct live_session_t {
     pub queued: Vec<String>,
     /// Approvals and questions already answered from this UI, so a double press sends once.
     pub resolved: HashSet<String>,
+    /// App-clock time the title card's logo started its reveal (D56). `None` when it shows
+    /// settled: animation off, a replayed session, the reveal done, or the card off screen.
+    pub logo_from: Option<u64>,
 }
 
 impl live_session_t {
@@ -150,6 +155,7 @@ impl live_session_t {
             phase,
             queued: Vec::new(),
             resolved: HashSet::new(),
+            logo_from: None,
         }
     }
 
@@ -196,7 +202,20 @@ pub struct app_t {
     pub sidebar_items: Vec<sidebar_item_t>,
     pub sidebar_sel: usize,
     pub sidebar_scroll: usize,
-    pub collapsed: BTreeSet<String>,
+    /// The rows of the conversation tree in the last frame, for drag auto-scroll.
+    pub sidebar_list: Rect,
+    /// The folders and which conversation is in which (D50), as of the last change.
+    pub organization: organization_t,
+    /// Folded folders, by id. UI state only: every folder starts unfolded (D54).
+    pub folded: BTreeSet<String>,
+    /// The folder-name prompt, when open.
+    pub prompt: Option<prompt_t>,
+    /// The folder whose delete waits for confirmation.
+    pub confirm: Option<String>,
+    /// Pick-up mode: what is being moved (D55).
+    pub pickup: Option<MoveSource>,
+    /// A sidebar row held by the mouse.
+    pub grab: Option<grab_t>,
     pub help_open: bool,
     pub help_scroll: usize,
     pub approval_sel: usize,
@@ -237,13 +256,15 @@ impl app_t {
         let session = runtime.new_session().map_err(|e| start_error_t {
             message: format!("could not start a session: {e}"),
         })?;
+        let mut first = live_session_t::new(session);
+        first.logo_from = options.animate.then_some(clock);
         let mut app = app_t {
             runtime,
             info,
             theme: theme_t::dark(),
             animate: options.animate,
             options,
-            sessions: vec![live_session_t::new(session)],
+            sessions: vec![first],
             active: 0,
             summaries: Vec::new(),
             summaries_at: 0,
@@ -255,7 +276,13 @@ impl app_t {
             sidebar_items: Vec::new(),
             sidebar_sel: 0,
             sidebar_scroll: 0,
-            collapsed: BTreeSet::new(),
+            sidebar_list: Rect::default(),
+            organization: organization_t::new(),
+            folded: BTreeSet::new(),
+            prompt: None,
+            confirm: None,
+            pickup: None,
+            grab: None,
             help_open: false,
             help_scroll: 0,
             approval_sel: 0,
@@ -278,6 +305,7 @@ impl app_t {
             redraw: false,
         };
         app.refresh_summaries();
+        app.load_organization();
         app.rebuild_sidebar_items();
         Ok(app)
     }
@@ -393,6 +421,15 @@ impl app_t {
         if self.help_open {
             return Modal::Help;
         }
+        if let Some(m) = self.sidebar_modal() {
+            return m;
+        }
+        self.pending_modal()
+    }
+
+    /// The approval or question waiting in the active session, whatever else is open. The dock
+    /// shows its widget even while a sidebar prompt has the keys.
+    pub fn pending_modal(&self) -> Modal {
         let Some(s) = self.active() else {
             return Modal::None;
         };
@@ -443,6 +480,11 @@ impl app_t {
                     // Input right after an Escape means the Escape was part of something else
                     // (crossterm issue 854): drop it.
                     self.pending_escape = None;
+                } else if self.grab.as_ref().is_some_and(|g| g.moved) {
+                    // A drag is live: the pointer keeps moving, and its events would drop a
+                    // delayed Escape, so this one acts at once.
+                    self.cancel_drag();
+                    return;
                 }
                 if let Some(action) = map_key(key, &self.key_ctx()) {
                     self.apply(action);
@@ -467,6 +509,12 @@ impl app_t {
                     MouseIntent::Drag(action) => self.apply(action),
                     MouseIntent::EndDrag => self.dragging = None,
                     MouseIntent::Hover(x, y) => self.hover = Some((x, y)),
+                    MouseIntent::Grab(index) => {
+                        self.hover = Some((mouse.column, mouse.row));
+                        self.grab_row(index);
+                    }
+                    MouseIntent::DragAt(x, y) => self.drag_to(x, y),
+                    MouseIntent::Release(x, y) => self.release_at(x, y),
                     MouseIntent::Nothing => {}
                 }
             }
@@ -475,6 +523,12 @@ impl app_t {
                 match self.modal() {
                     Modal::Question => {
                         self.answer.apply(EditOp::Paste(text.clone()));
+                    }
+                    Modal::Prompt => {
+                        let line = text.replace(['\r', '\n', '\t'], " ");
+                        if let Some(p) = self.prompt.as_mut() {
+                            p.editor.apply(EditOp::Paste(line));
+                        }
                     }
                     Modal::None => {
                         self.focus = Focus::Input;
@@ -505,12 +559,20 @@ impl app_t {
         self.size = (w, h);
         if w < DockWidth {
             self.drawer_open = self.drawer_open && self.focus == Focus::Sidebar;
+            if self.sidebar_modal().is_some() {
+                // The prompt, confirmation or pick-up stays in view in the drawer.
+                self.drawer_open = true;
+                self.focus = Focus::Sidebar;
+            }
         }
     }
 
     fn resolve_escape(&mut self) {
         if self.help_open {
             self.help_open = false;
+            return;
+        }
+        if self.cancel_sidebar_modal() {
             return;
         }
         if self.busy() {
@@ -567,6 +629,9 @@ impl app_t {
             Action::Submit => self.submit(),
             Action::Escape => self.pending_escape = Some(self.clock),
             Action::Interrupt => {
+                if self.cancel_sidebar_modal() {
+                    return;
+                }
                 if self.busy() {
                     self.cancel_turn();
                 } else if !self.composer.is_empty() {
@@ -620,6 +685,9 @@ impl app_t {
             Action::FocusNext => self.cycle_focus(1),
             Action::FocusPrev => self.cycle_focus(-1),
             Action::SetFocus(f) => {
+                if f != Focus::Sidebar {
+                    self.cancel_sidebar_modal();
+                }
                 self.focus = f;
                 if f == Focus::Transcript {
                     self.select_last_block();
@@ -674,13 +742,7 @@ impl app_t {
                     s.transcript.toggle_expanded(id);
                 }
             }
-            Action::SidebarMove(d) => {
-                let n = self.sidebar_items.len();
-                if n > 0 {
-                    let next = (self.sidebar_sel as i64 + i64::from(d)).clamp(0, n as i64 - 1);
-                    self.sidebar_sel = next as usize;
-                }
-            }
+            Action::SidebarMove(d) => self.sidebar_step(d),
             Action::SidebarActivate => self.sidebar_activate(self.sidebar_sel),
             Action::SidebarActivateAt(i) => {
                 self.focus = Focus::Sidebar;
@@ -689,6 +751,43 @@ impl app_t {
             }
             Action::SidebarScroll(d) => {
                 self.sidebar_scroll = (self.sidebar_scroll as i64 + i64::from(d)).max(0) as usize;
+            }
+            Action::SidebarFold(fold) => self.fold_selected(fold),
+            Action::NewFolder => self.start_create(None),
+            Action::NewSubfolder => {
+                let parent = self.selected_folder();
+                self.start_create(parent);
+            }
+            Action::NewSubfolderAt(i) => {
+                self.select_row(i);
+                self.apply(Action::NewSubfolder);
+            }
+            Action::RenameFolder => self.start_rename(),
+            Action::RenameFolderAt(i) => {
+                self.select_row(i);
+                self.start_rename();
+            }
+            Action::DeleteFolder => self.start_delete(),
+            Action::DeleteFolderAt(i) => {
+                self.select_row(i);
+                self.start_delete();
+            }
+            Action::PickUp => self.start_pickup(),
+            Action::PickUpAt(i) => {
+                self.select_row(i);
+                self.start_pickup();
+            }
+            Action::MoveStep(d) => self.move_step(d),
+            Action::MoveDrop => self.drop_at(self.sidebar_sel),
+            Action::PromptEdit(op) => {
+                if let Some(p) = self.prompt.as_mut() {
+                    p.editor.apply(op);
+                }
+            }
+            Action::PromptSubmit => self.prompt_submit(),
+            Action::ConfirmYes => self.confirm_delete(),
+            Action::SidebarCancel => {
+                self.cancel_sidebar_modal();
             }
             Action::Approve(decision) => self.approve(decision),
             Action::ApprovalMove(d) => {
@@ -764,6 +863,7 @@ impl app_t {
     }
 
     fn cycle_focus(&mut self, d: i32) {
+        self.cancel_sidebar_modal();
         let sidebar_open = match self.layout.sidebar_mode() {
             SidebarMode::Hidden => false,
             SidebarMode::Docked | SidebarMode::Drawer => true,
@@ -822,6 +922,8 @@ impl app_t {
     }
 
     fn toggle_sidebar(&mut self) {
+        self.cancel_sidebar_modal();
+        self.grab = None;
         if self.size.0 >= DockWidth {
             self.sidebar_pinned = !self.sidebar_pinned;
             if !self.sidebar_pinned && self.focus == Focus::Sidebar {
@@ -899,6 +1001,10 @@ impl app_t {
             Command::ClearQueue => self.apply(Action::ClearQueue),
             Command::Copy => self.copy_reply(),
             Command::Animate => self.apply(Action::ToggleAnimation),
+            Command::Folder(None) => self.start_create(None),
+            Command::Folder(Some(name)) => {
+                self.create_folder_named(name, None);
+            }
             Command::Quit => self.quit = true,
         }
     }
@@ -917,7 +1023,9 @@ impl app_t {
     pub fn new_chat(&mut self) {
         match self.runtime.new_session() {
             Ok(session) => {
-                self.sessions.push(live_session_t::new(session));
+                let mut live = live_session_t::new(session);
+                live.logo_from = self.animate.then_some(self.clock);
+                self.sessions.push(live);
                 self.active = self.sessions.len() - 1;
                 self.focus = Focus::Input;
                 self.drawer_open = false;
@@ -975,9 +1083,10 @@ impl app_t {
         };
         match item.kind {
             SidebarItemKind::NewChat => self.new_chat(),
-            SidebarItemKind::Project { name, .. } => {
-                if !self.collapsed.remove(&name) {
-                    self.collapsed.insert(name);
+            SidebarItemKind::Root => {}
+            SidebarItemKind::Folder { id, .. } => {
+                if !self.folded.remove(&id) {
+                    self.folded.insert(id);
                 }
                 self.rebuild_sidebar_items();
             }
@@ -1081,52 +1190,42 @@ impl app_t {
         }
     }
 
-    /// The sidebar list: new chat, then projects (the current one first) with their sessions.
+    /// The sidebar list: new chat, the "conversations" label, then the tree: folders sorted by
+    /// name with their sub-folders and conversations, then unfiled conversations, newest first
+    /// (D54). Rows carry their move marks while something moves (D55).
     pub fn rebuild_sidebar_items(&mut self) {
-        let mut items = vec![sidebar_item_t {
-            kind: SidebarItemKind::NewChat,
-            title: "New chat".to_string(),
-            detail: String::new(),
-            active: false,
-            activity: Activity::Idle,
-            demo: false,
-        }];
         struct entry_t {
             id: String,
             title: String,
             updated: u64,
             turns: u32,
             demo: bool,
+            project: String,
         }
         let current_project = sanitize(&self.info.project, false);
-        let mut groups: Vec<(String, Vec<entry_t>)> = Vec::new();
-        let mut push =
-            |project: String, e: entry_t| match groups.iter_mut().find(|(p, _)| *p == project) {
-                Some((_, list)) => list.push(e),
-                None => groups.push((project, vec![e])),
-            };
+        let mut entries: Vec<entry_t> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for s in &self.summaries {
-            seen.insert(s.id.clone());
+            if !seen.insert(s.id.clone()) {
+                continue;
+            }
             let title = if s.title.trim().is_empty() {
                 "New chat".to_string()
             } else {
                 sanitize(&s.title, false)
             };
-            push(
-                sanitize(&s.project, false),
-                entry_t {
-                    id: s.id.clone(),
-                    title,
-                    updated: s.updated_ms,
-                    turns: s.turns,
-                    demo: s.simulated,
-                },
-            );
+            entries.push(entry_t {
+                id: s.id.clone(),
+                title,
+                updated: s.updated_ms,
+                turns: s.turns,
+                demo: s.simulated,
+                project: sanitize(&s.project, false),
+            });
         }
         for live in &self.sessions {
             let id = live.session.id().to_string();
-            if seen.contains(&id) {
+            if !seen.insert(id.clone()) {
                 continue;
             }
             let project = live
@@ -1135,67 +1234,127 @@ impl app_t {
                 .as_ref()
                 .map(|m| sanitize(&m.project, false))
                 .unwrap_or_else(|| current_project.clone());
-            push(
-                project,
-                entry_t {
-                    id,
-                    title: live.title(),
-                    updated: if live.transcript.last_at_ms > 0 {
-                        live.transcript.last_at_ms
-                    } else {
-                        self.now_ms
-                    },
-                    turns: live.transcript.turn.turn,
-                    demo: self.info.identity.simulated(),
-                },
-            );
-        }
-        for (_, list) in groups.iter_mut() {
-            list.sort_by_key(|e| std::cmp::Reverse(e.updated));
-        }
-        groups.sort_by(|a, b| {
-            let a_cur = a.0 == current_project;
-            let b_cur = b.0 == current_project;
-            b_cur.cmp(&a_cur).then_with(|| {
-                let a_t = a.1.first().map(|e| e.updated).unwrap_or(0);
-                let b_t = b.1.first().map(|e| e.updated).unwrap_or(0);
-                b_t.cmp(&a_t)
-            })
-        });
-        let active_id = self.active().map(|s| s.session.id().to_string());
-        for (project, list) in groups {
-            let collapsed = self.collapsed.contains(&project);
-            items.push(sidebar_item_t {
-                kind: SidebarItemKind::Project {
-                    name: project.clone(),
-                    collapsed,
-                },
-                title: if project.is_empty() {
-                    "(no project)".to_string()
+            entries.push(entry_t {
+                id,
+                title: live.title(),
+                updated: if live.transcript.last_at_ms > 0 {
+                    live.transcript.last_at_ms
                 } else {
-                    project.clone()
+                    self.now_ms
                 },
-                detail: list.len().to_string(),
+                turns: live.transcript.turn.turn,
+                demo: self.info.identity.simulated(),
+                project,
+            });
+        }
+        entries.sort_by_key(|e| std::cmp::Reverse(e.updated));
+        let active_id = self.active().map(|s| s.session.id().to_string());
+        let activity_of = |id: &str| {
+            self.sessions
+                .iter()
+                .find(|s| s.session.id() == id)
+                .map(live_session_t::activity)
+                .unwrap_or(Activity::Idle)
+        };
+        // Conversations by folder. A conversation filed in a folder that does not exist is
+        // listed as unfiled (the organisation's rules make that impossible, D51).
+        let org = &self.organization;
+        let mut filed: BTreeMap<String, Vec<sidebar_item_t>> = BTreeMap::new();
+        let mut unfiled: Vec<sidebar_item_t> = Vec::new();
+        for e in entries {
+            let mut detail = format!("{} · {}t", format_age(self.now_ms, e.updated), e.turns);
+            if !e.project.is_empty() && e.project != current_project {
+                detail = format!("{} · {detail}", truncate(&e.project, 12));
+            }
+            let item = sidebar_item_t {
+                active: active_id.as_deref() == Some(e.id.as_str()),
+                detail,
+                activity: activity_of(&e.id),
+                kind: SidebarItemKind::Session { id: e.id.clone() },
+                title: e.title,
+                demo: e.demo,
+                depth: 0,
+                mark: MoveMark::None,
+            };
+            match org.folder_of(&e.id).filter(|f| org.folder(f).is_some()) {
+                Some(folder) => filed.entry(folder.to_string()).or_default().push(item),
+                None => unfiled.push(item),
+            }
+        }
+        let mut items = vec![
+            sidebar_item_t {
+                kind: SidebarItemKind::NewChat,
+                title: "New chat".to_string(),
+                detail: String::new(),
                 active: false,
                 activity: Activity::Idle,
                 demo: false,
-            });
-            if collapsed {
-                continue;
+                depth: 0,
+                mark: MoveMark::None,
+            },
+            sidebar_item_t {
+                kind: SidebarItemKind::Root,
+                title: "conversations".to_string(),
+                detail: String::new(),
+                active: false,
+                activity: Activity::Idle,
+                demo: false,
+                depth: 0,
+                mark: MoveMark::None,
+            },
+        ];
+        fn walk(
+            org: &organization_t,
+            parent: Option<&str>,
+            depth: usize,
+            folded: &BTreeSet<String>,
+            filed: &BTreeMap<String, Vec<sidebar_item_t>>,
+            out: &mut Vec<sidebar_item_t>,
+        ) {
+            if depth > harness::organize::MaxFolderDepth {
+                return;
             }
-            for e in list {
-                let live = self.sessions.iter().find(|s| s.session.id() == e.id);
-                let activity = live.map(live_session_t::activity).unwrap_or(Activity::Idle);
-                items.push(sidebar_item_t {
-                    active: active_id.as_deref() == Some(e.id.as_str()),
-                    detail: format!("{} · {}t", format_age(self.now_ms, e.updated), e.turns),
-                    kind: SidebarItemKind::Session { id: e.id },
-                    title: e.title,
+            for folder in org.children(parent) {
+                let collapsed = folded.contains(&folder.id);
+                let inside: Vec<&sidebar_item_t> = filed
+                    .iter()
+                    .filter(|(f, _)| org.is_within(f, &folder.id))
+                    .flat_map(|(_, list)| list.iter())
+                    .collect();
+                let activity = if inside.iter().any(|i| i.activity == Activity::Waiting) {
+                    Activity::Waiting
+                } else if inside.iter().any(|i| i.activity == Activity::Generating) {
+                    Activity::Generating
+                } else {
+                    Activity::Idle
+                };
+                out.push(sidebar_item_t {
+                    kind: SidebarItemKind::Folder {
+                        id: folder.id.clone(),
+                        collapsed,
+                    },
+                    title: sanitize(&folder.name, false),
+                    detail: org.session_count(&folder.id).to_string(),
+                    active: false,
                     activity,
-                    demo: e.demo,
+                    demo: false,
+                    depth,
+                    mark: MoveMark::None,
                 });
+                if collapsed {
+                    continue;
+                }
+                walk(org, Some(&folder.id), depth + 1, folded, filed, out);
+                for item in filed.get(&folder.id).into_iter().flatten() {
+                    let mut item = item.clone();
+                    item.depth = depth + 1;
+                    out.push(item);
+                }
             }
         }
+        walk(org, None, 0, &self.folded, &filed, &mut items);
+        items.extend(unfiled);
+        self.mark_moves(&mut items);
         self.sidebar_sel = self.sidebar_sel.min(items.len().saturating_sub(1));
         self.sidebar_items = items;
     }

@@ -590,7 +590,15 @@ Every mouse action has a keyboard path, and a table-driven test in `crates/tui` 
 | Scroll | wheel, drag or click the scrollbar | `pgup`, `pgdn`, `ctrl+home`, `ctrl+end` |
 | Jump to the latest | click the chip | `ctrl+end` |
 | New chat | the `+ New chat` button | `ctrl+n`, `/new` |
-| Open a conversation | click a row | `tab` to the sidebar, `j` `k`, `enter` |
+| Open a conversation | click a row (acts on release, so a press can start a drag) | `tab` to the sidebar, `j` `k`, `enter` |
+| New folder (top level) | the `+ folder` button on the "conversations" row | `ctrl+f` from any focus, `/folder [name]` |
+| New sub-folder | the `+` chip on a hovered or selected folder row | sidebar: select the folder, `f` (top level when a conversation is selected) |
+| Rename a folder | the `✎` chip | sidebar: `r` |
+| Delete a folder (its contents move up) | the `✕` chip, then the `enter confirm` button | sidebar: `d` or `delete`, then `enter` or `y`; `n` or `esc` cancels |
+| Fold or unfold a folder | click the folder row | `enter`, `space`; `←` or `h` folds or goes to the parent, `→` or `l` unfolds |
+| Name prompt (create, rename) | | type, `enter` confirms, `esc` or `ctrl+c` cancels |
+| Move a conversation or folder by drag | press a row, drag, release on a folder, or on "conversations" for the top level | use pick-up |
+| Move by pick-up | the `⇢` chip, then click a destination | `m`, `j` `k` choose, `enter` or `space` drops, `esc` cancels |
 | Toggle the sidebar (a drawer below 100 columns) | click the chip | `ctrl+b`, `/sidebar` |
 | Clear the queue | click the chip | `ctrl+x`, `/clear-queue` |
 | Copy the last reply (OSC 52) | | `ctrl+y`, `/copy` |
@@ -598,7 +606,7 @@ Every mouse action has a keyboard path, and a table-driven test in `crates/tui` 
 | Approval mode | | `/approval ask` or `edit`. `full` is refused. |
 | Help, quit | | `?` or `f1`, `/help`; `ctrl+d` on an empty input, `ctrl+c` twice, `/quit` |
 
-Slash commands: `/help`, `/new`, `/sidebar`, `/approval`, `/cancel`, `/clear-queue`, `/copy`, `/animate`, `/quit`.
+Slash commands: `/help`, `/new`, `/sidebar`, `/approval`, `/cancel`, `/clear-queue`, `/copy`, `/animate`, `/folder`, `/quit`.
 
 ### Known limitations
 
@@ -609,6 +617,7 @@ Slash commands: `/help`, `/new`, `/sidebar`, `/approval`, `/cancel`, `/clear-que
 - **Budget and attempts.** `runtime_info_t` does not carry `pass_budget` or `max_attempts`, so the UI shows passes without the budget and says "attempt N" rather than "N of 3".
 - **Pass budget.** It is checked when an attempt starts, so one attempt can overshoot it by up to K minus 1 passes.
 - **Empty sessions.** Each launch writes a one-line log for its empty "New chat". Empty logs accumulate until a later task prunes them. The demo store loads every log in full to build the sidebar list.
+- **Folders.** Folder fold state is not saved (D54). A duplicate session key inside the `filed` object of `folders.json` is not refused, because the JSON reader keeps the last one. Drag needs a terminal that reports pointer drags, and the hover chips need pointer motion; pick-up (`m`) and the keys cover both. Drag auto-scroll runs only on pointer-motion events. The `+ folder` button is drawn but inert with `--no-mouse`. Drag, hover and the logo reveal were checked with an emulator (pyte) and synthetic events, not a real terminal or mouse.
 - **Platforms.** The macOS and Windows demo-state paths (D40) follow platform conventions and were not run. Windows and macOS builds were not made.
 - **Not built:** drag selection inside the UI (use Shift and drag in the terminal), "interrupt and send", clicking a level cell to view its draft (N4), and header clock times (durations are shown, since there is no local-time source).
 - **Preview fixture.** `crates/tui/src/scripted.rs` replays scripted events for the UI gallery. It is behind the `preview` feature, is not a backend, and is not in the shipped binary. Run it with `cargo run -p tui --features preview --example gallery`.
@@ -699,6 +708,13 @@ Each decision names its basis. "Design choice" means the choice comes from this 
 - **D48a. UI constants chosen during P1.** The Escape delay is 70 ms. The sidebar docks at 100 columns or more, 34 columns wide (38 from 150 columns), and below 100 columns it is a drawer. The smallest terminal is 40 by 12. The UI adds `ctrl+x` (clear the queue), `ctrl+t` and `/animate` (animation on or off). The speaker rails are white (you), ice blue (ncagent), orchid (tools), amber (approvals), gold (questions) and red (errors), on tone steps of the black background. The scripted preview fixture is behind the `preview` cargo feature, so the shipped binary does not contain it (O1 point 2). Basis: design choices recorded from the UI work. They are not measured.
 - **D48b. No real tool runner exists yet.** `harness::tools::unavailable_tool_runner_t` returns `ToolErrorKind::NotImplemented` for every call and runs nothing. `ncagent chat` calls `ncm::engine::open_export`, which returns a named error today. If it ever returned a backend, `chat` still stops with a named error naming H1, because production sessions have no store yet. Basis: AGENTS.md, "return an error that names the feature".
 - **D49. Colours and Markdown.** The transcript renders Markdown through `pulldown-cmark`: headings, emphasis, strong, inline and fenced code, lists, block quotes, rules, links and simple tables. Basis: owner UI direction asks for Markdown.
+- **D50. Conversation folders are organisation state, apart from the session logs.** A folder is `folder_t { id, name, parent }`. The `organization_t` holds the folders and a map from session id to folder id. A session in no folder is "unfiled" and is listed at the top level. The session event logs are not touched, so filing a conversation never rewrites a log (D24). `harness::organize` defines the types, the pure operations and the `organization_store_t` trait, with an in-memory store. The demo's file store writes `folders.json` under the demo directory (D40) through a temporary file and a rename, and the file carries the demo label. Basis: owner request for folders, sub-folders and moving conversations into them. Event logs are append-only, so a move cannot be an edit of a log.
+- **D51. Folder rules.** Folder ids are `f` and a number (`f1`, `f2`, ...), one more than the largest id in use. A name is 1 to 40 characters after trimming, with no control characters, and is unique among its siblings, ignoring case. Folders nest to `MaxFolderDepth` = 5 levels. A move that would put a folder inside itself or its descendant, past the depth limit or onto a sibling's name is refused with a named error. Deleting a folder moves its sub-folders and conversations up to its parent. It never deletes a conversation. Basis: design choices for the prototype. Cycles and unbounded depth would make the list unreadable, and a delete that removed conversations would lose user data.
+- **D52. The file is untrusted input.** `organization_t::from_json` returns a typed error for malformed JSON, an unknown version, a duplicate id, a missing parent, a cycle, a depth over the limit, a bad name, a name taken among siblings, or an assignment to a missing folder. Each change loads the file, applies the operation and saves, so a file that does not parse is never overwritten. The UI shows the error and the folders stay as they were on disk. Basis: AGENTS.md, "files on disk are untrusted input", and the rule that a parser returns typed errors.
+- **D53. One API method changes folders.** `runtime_t::organization()` reads and `runtime_t::organize(OrganizeOp)` changes, where an operation is create, rename, delete or move of a folder, or move of a session. Each change returns the new `organization_t`. Basis: one method keeps the UI trait small, and a test fake needs to implement only two.
+- **D54. Folders replace the per-project grouping in the sidebar.** The conversation list is a tree of folders, then unfiled conversations, newest first. A row shows its project name only when it differs from the current project. Folders and sub-folders sort by name, ignoring case, and start expanded in each run (the fold state is not saved). Basis: with folders the project headers were a second, competing grouping, and a demo run has one project.
+- **D55. Moving works by drag and by pick-up.** A press on a conversation or folder row, a drag to another row and a release moves it into that folder, or to the top level when released on the "conversations" label. `m` (or the move chip on a row) picks the row up, `j` `k` or a click choose the destination, `enter` or the click drops it, and `esc` cancels. Choices that are not allowed are shown dim and refused. Basis: owner request for drag, with a fallback if drag is not possible. Terminals that do not report mouse drags still have the pick-up path, which is keyboard and click only.
+- **D56. Startup logo effect.** On start the title card's logo dissolves in from left to right with the same level-by-level block effect as a reply (D47), and settles in about a second. It is skipped when animation is off (`--speed instant`, `/animate`) and when the logo is not on screen. Basis: owner request.
 
 Superseded decisions from the previous revision: Zig 0.17.0 as the language (D1), the Python converter (D2 and D7), and the project's own safetensors reader (D4). Each is replaced above, and the old text is not kept.
 

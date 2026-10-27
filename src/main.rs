@@ -98,10 +98,11 @@ enum Command {
         /// Session seed.
         #[arg(long, default_value_t = DefaultSeed)]
         seed: u64,
-        /// Directory for demo state. Defaults to the platform's local data directory.
+        /// Directory for demo state: sessions in `sessions/`, folders in `folders.json`.
+        /// Defaults to the platform's local data directory.
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Keep no demo state on disk.
+        /// Keep no demo state on disk. Sessions and folders are kept in memory only.
         #[arg(long)]
         ephemeral: bool,
         /// Do not capture the mouse.
@@ -195,19 +196,27 @@ fn run_demo(
     };
     let (backend, tools) = demo::build(profile_kind, timing);
 
-    let (store, state_note): (Arc<dyn session_store_t>, String) = if ephemeral {
-        (
-            Arc::new(memory_store_t::new()),
-            "demo state: kept in memory only (--ephemeral)".to_string(),
-        )
-    } else {
-        let dir = match state_dir {
-            Some(dir) => dir,
-            None => demo::paths::default_state_dir().map_err(CliError::Setup)?,
+    // The state directory holds the sessions and `folders.json` (D40, D50). `None` keeps both in
+    // memory.
+    let (store, state_dir, state_note): (Arc<dyn session_store_t>, Option<PathBuf>, String) =
+        if ephemeral {
+            (
+                Arc::new(memory_store_t::new()),
+                None,
+                "demo state: kept in memory only (--ephemeral)".to_string(),
+            )
+        } else {
+            let dir = match state_dir {
+                Some(dir) => dir,
+                None => demo::paths::default_state_dir().map_err(CliError::Setup)?,
+            };
+            let note = format!("demo state: {}", dir.display());
+            (
+                Arc::new(demo::store::file_store_t::new(dir.clone())),
+                Some(dir),
+                note,
+            )
         };
-        let note = format!("demo state: {}", dir.display());
-        (Arc::new(demo::store::file_store_t::new(dir)), note)
-    };
 
     let cwd = std::env::current_dir()
         .map_err(|err| CliError::Setup(format!("cannot read the working directory: {err}")))?;
@@ -226,6 +235,12 @@ fn run_demo(
     };
     let runtime =
         controller_runtime_t::new(backend, tools, store, config).map_err(CliError::Session)?;
+    let runtime = match state_dir {
+        Some(dir) => runtime.with_organization_store(Arc::new(
+            demo::organize::file_organization_store_t::new(dir),
+        )),
+        None => runtime,
+    };
     let options = tui_options_t {
         animate: speed != SpeedArg::Instant,
         mouse: !no_mouse,

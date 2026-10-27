@@ -55,6 +55,12 @@ fn pixel(rows: &[&str; 12], y: usize, x: usize) -> bool {
         .is_some_and(|b| *b == b'#')
 }
 
+/// Whether the title card at `width` columns draws the block logo (wide enough) rather than the
+/// one-line wordmark.
+pub fn logo_shown(width: usize) -> bool {
+    width.max(1) >= LogoWidth + 2
+}
+
 /// The logo as plain text rows.
 pub fn logo_rows() -> Vec<String> {
     let mut out = Vec::with_capacity(LogoRows);
@@ -201,7 +207,7 @@ pub fn title_card(input: &card_input_t<'_>, width: usize, theme: &theme_t) -> Ve
     let info = input.info;
     let mut out = Vec::new();
     let side_by_side = width >= LogoWidth + 4 + 34;
-    if width >= LogoWidth + 2 {
+    if logo_shown(width) {
         let logo = logo_rows();
         let details = if side_by_side {
             info_lines(input, width - LogoWidth - 4, theme)

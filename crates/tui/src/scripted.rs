@@ -13,7 +13,7 @@
 //!   call, an approval, a question, a retry), waiting for the user where a real turn would.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harness::api::{
@@ -22,6 +22,7 @@ use harness::api::{
 use harness::approval::{ApprovalDecision, ApprovalMode, ApprovalSource};
 use harness::backend::{BackendKind, capabilities_t, model_identity_t, sampler_t};
 use harness::event::{CancelScope, ReplyItem, SessionEvent, TurnOutcome, stamped_event_t};
+use harness::organize::{OrganizeOp, organization_t};
 use harness::store::{session_summary_t, summarize_events};
 use harness::tools::{ApprovalClass, ToolErrorKind, parsed_call_t, tool_arg_t};
 
@@ -774,6 +775,11 @@ pub struct scripted_runtime_t {
     mode: Mode,
     handles: Mutex<Vec<script_handle_t>>,
     stored: Mutex<Vec<stored_t>>,
+    /// Folders, kept in memory with the real rules of `harness::organize` (D50, D51).
+    organization: Mutex<organization_t>,
+    /// When set, `organization` and `organize` return this error, as a store whose file does
+    /// not load would (D52).
+    organization_error: Mutex<Option<SessionError>>,
 }
 
 impl scripted_runtime_t {
@@ -784,6 +790,8 @@ impl scripted_runtime_t {
             mode: Mode::Manual,
             handles: Mutex::new(Vec::new()),
             stored: Mutex::new(Vec::new()),
+            organization: Mutex::new(organization_t::new()),
+            organization_error: Mutex::new(None),
         }
     }
 
@@ -794,6 +802,8 @@ impl scripted_runtime_t {
             mode: Mode::Preview,
             handles: Mutex::new(Vec::new()),
             stored: Mutex::new(Vec::new()),
+            organization: Mutex::new(organization_t::new()),
+            organization_error: Mutex::new(None),
         }
     }
 
@@ -805,6 +815,29 @@ impl scripted_runtime_t {
                 events,
             });
         }
+    }
+
+    /// Make every folder call fail with `err`, or work again with `None`.
+    pub fn fail_organization(&self, err: Option<SessionError>) {
+        *self
+            .organization_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = err;
+    }
+
+    /// Apply a folder change directly, for test and gallery setup.
+    pub fn seed_organization(&self, ops: &[OrganizeOp]) -> Result<(), SessionError> {
+        for op in ops {
+            self.organize(op.clone())?;
+        }
+        Ok(())
+    }
+
+    fn organization_failure(&self) -> Option<SessionError> {
+        self.organization_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The handle of the n-th session made by `new_session` or `open_session`.
@@ -910,6 +943,31 @@ impl runtime_t for scripted_runtime_t {
             events,
             skipped_lines: 0,
         })
+    }
+
+    fn organization(&self) -> Result<organization_t, SessionError> {
+        if let Some(err) = self.organization_failure() {
+            return Err(err);
+        }
+        Ok(self
+            .organization
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone())
+    }
+
+    fn organize(&self, op: OrganizeOp) -> Result<organization_t, SessionError> {
+        if let Some(err) = self.organization_failure() {
+            return Err(err);
+        }
+        let mut held = self
+            .organization
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut next = held.clone();
+        next.apply(&op)?;
+        *held = next.clone();
+        Ok(next)
     }
 }
 

@@ -12,7 +12,7 @@ pub struct command_t {
     pub about: &'static str,
 }
 
-pub const Commands: [command_t; 9] = [
+pub const Commands: [command_t; 10] = [
     command_t {
         name: "/help",
         args: "",
@@ -54,6 +54,11 @@ pub const Commands: [command_t; 9] = [
         about: "turn the generation effect on or off",
     },
     command_t {
+        name: "/folder",
+        args: "[name]",
+        about: "new folder at the top level",
+    },
+    command_t {
         name: "/quit",
         args: "",
         about: "leave ncagent",
@@ -70,6 +75,8 @@ pub enum Command {
     ClearQueue,
     Copy,
     Animate,
+    /// A new top-level folder: with a name it is created at once, without one the prompt opens.
+    Folder(Option<String>),
     Quit,
 }
 
@@ -98,6 +105,12 @@ pub fn parse(text: &str) -> Option<Result<Command, String>> {
         "/copy" => simple(Command::Copy),
         "/animate" => simple(Command::Animate),
         "/quit" | "/exit" => simple(Command::Quit),
+        "/folder" => {
+            let rest = text.get(name.len()..).unwrap_or("").trim();
+            Ok(Command::Folder(
+                (!rest.is_empty()).then(|| rest.to_string()),
+            ))
+        }
         "/approval" => match (arg, extra) {
             (Some("ask"), None) => Ok(Command::Approval(ApprovalMode::Ask)),
             (Some("edit"), None) => Ok(Command::Approval(ApprovalMode::Edit)),
@@ -147,6 +160,11 @@ mod tests {
         assert_eq!(parse("/copy"), Some(Ok(Command::Copy)));
         assert_eq!(parse("/animate"), Some(Ok(Command::Animate)));
         assert_eq!(parse("/quit"), Some(Ok(Command::Quit)));
+        assert_eq!(parse("/folder"), Some(Ok(Command::Folder(None))));
+        assert_eq!(
+            parse("/folder  Research notes "),
+            Some(Ok(Command::Folder(Some("Research notes".into()))))
+        );
     }
 
     #[test]

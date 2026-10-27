@@ -15,6 +15,7 @@ pub mod api;
 pub mod approval;
 pub mod controller;
 pub mod event;
+pub mod organize;
 pub mod pack;
 pub mod replay;
 pub mod reply;

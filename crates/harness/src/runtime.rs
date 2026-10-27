@@ -5,8 +5,8 @@
 //! store (PROJECT.md, "UI prototype (P1)", "Event stream and session API").
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ncm::backend::backend_t;
@@ -14,6 +14,9 @@ use ncm::backend::backend_t;
 use crate::api::{SessionError, hint_t, opened_session_t, runtime_info_t, runtime_t, session_t};
 use crate::approval::ApprovalMode;
 use crate::controller::{controller_session_t, session_deps_t};
+use crate::organize::{
+    OrganizeOp, memory_organization_store_t, organization_store_t, organization_t,
+};
 use crate::replay::restore;
 use crate::store::{session_store_t, session_summary_t};
 use crate::tools::tool_runner_t;
@@ -95,6 +98,9 @@ fn new_session_id(clock_ms: u64) -> String {
 pub struct controller_runtime_t {
     deps: session_deps_t,
     info: runtime_info_t,
+    organization: Arc<dyn organization_store_t>,
+    /// Held across a load, a change and a save, so two changes never interleave.
+    organize_lock: Mutex<()>,
 }
 
 impl controller_runtime_t {
@@ -125,7 +131,18 @@ impl controller_runtime_t {
             store,
             config,
         };
-        Ok(controller_runtime_t { deps, info })
+        Ok(controller_runtime_t {
+            deps,
+            info,
+            organization: Arc::new(memory_organization_store_t::new()),
+            organize_lock: Mutex::new(()),
+        })
+    }
+
+    /// Keeps the folders in `store` instead of in memory (D50).
+    pub fn with_organization_store(mut self, store: Arc<dyn organization_store_t>) -> Self {
+        self.organization = store;
+        self
     }
 }
 
@@ -160,12 +177,28 @@ impl runtime_t for controller_runtime_t {
             skipped_lines: loaded.skipped_lines,
         })
     }
+
+    fn organization(&self) -> Result<organization_t, SessionError> {
+        Ok(self.organization.load()?)
+    }
+
+    fn organize(&self, op: OrganizeOp) -> Result<organization_t, SessionError> {
+        let _held = self
+            .organize_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut organization = self.organization.load()?;
+        organization.apply(&op)?;
+        self.organization.save(&organization)?;
+        Ok(organization)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use ncm::backend::{BackendError, backend_t};
 
@@ -173,6 +206,10 @@ mod tests {
     use crate::approval::ApprovalMode;
     use crate::controller::test_support::*;
     use crate::event::SessionEvent;
+    use crate::organize::{
+        OrganizeError, OrganizeOp, memory_organization_store_t, organization_store_t,
+        organization_t,
+    };
     use crate::store::{memory_store_t, session_store_t, valid_session_id};
 
     use super::{controller_runtime_t, system_clock};
@@ -393,5 +430,113 @@ mod tests {
     fn system_clock_reads_milliseconds_since_the_epoch() {
         // 2020-09-13 in milliseconds. Any real clock is later than that.
         assert!(system_clock() > 1_600_000_000_000);
+    }
+
+    /// A runtime whose folders are kept in `folders`.
+    fn runtime_keeping_folders_in(folders: Arc<dyn organization_store_t>) -> controller_runtime_t {
+        runtime_with(
+            Arc::new(fake_backend_t::new(Vec::new())),
+            Arc::new(fake_tools_t::new(false)),
+            Arc::new(memory_store_t::new()),
+            test_config(ApprovalMode::Ask),
+        )
+        .with_organization_store(folders)
+    }
+
+    /// A store whose load always fails. It counts the saves, which must stay at zero.
+    struct failing_store_t {
+        saves: AtomicUsize,
+    }
+
+    impl organization_store_t for failing_store_t {
+        fn load(&self) -> Result<organization_t, OrganizeError> {
+            Err(OrganizeError::Io {
+                path: "folders.json".to_string(),
+                message: "simulated read failure".to_string(),
+            })
+        }
+
+        fn save(&self, _organization: &organization_t) -> Result<(), OrganizeError> {
+            self.saves.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_fresh_runtime_has_no_folders() {
+        let runtime = runtime_with(
+            Arc::new(fake_backend_t::new(Vec::new())),
+            Arc::new(fake_tools_t::new(false)),
+            Arc::new(memory_store_t::new()),
+            test_config(ApprovalMode::Ask),
+        );
+        assert_eq!(
+            runtime.organization().expect("the folders load"),
+            organization_t::new()
+        );
+    }
+
+    #[test]
+    fn organize_applies_a_change_and_another_runtime_on_the_same_store_sees_it() {
+        let folders = Arc::new(memory_organization_store_t::new());
+        let first = runtime_keeping_folders_in(folders.clone());
+        let after = first
+            .organize(OrganizeOp::CreateFolder {
+                name: "Research".to_string(),
+                parent: None,
+            })
+            .expect("the folder is created");
+        assert_eq!(after.children(None).len(), 1);
+        assert_eq!(after.children(None)[0].name, "Research");
+
+        let second = runtime_keeping_folders_in(folders);
+        assert_eq!(second.organization().expect("the folders load"), after);
+    }
+
+    #[test]
+    fn a_refused_change_returns_its_error_and_keeps_the_folders() {
+        let runtime = runtime_keeping_folders_in(Arc::new(memory_organization_store_t::new()));
+        runtime
+            .organize(OrganizeOp::CreateFolder {
+                name: "Outer".to_string(),
+                parent: None,
+            })
+            .expect("the outer folder is created");
+        runtime
+            .organize(OrganizeOp::CreateFolder {
+                name: "Inner".to_string(),
+                parent: Some("f1".to_string()),
+            })
+            .expect("the inner folder is created");
+        let before = runtime.organization().expect("the folders load");
+
+        let refused = runtime.organize(OrganizeOp::MoveFolder {
+            id: "f1".to_string(),
+            parent: Some("f2".to_string()),
+        });
+        assert!(matches!(
+            refused,
+            Err(SessionError::Organize(OrganizeError::WouldNest { .. }))
+        ));
+        assert_eq!(runtime.organization().expect("the folders load"), before);
+    }
+
+    #[test]
+    fn folders_that_do_not_load_are_never_saved_over() {
+        let store = Arc::new(failing_store_t {
+            saves: AtomicUsize::new(0),
+        });
+        let runtime = runtime_keeping_folders_in(store.clone());
+
+        let result = runtime.organize(OrganizeOp::CreateFolder {
+            name: "New".to_string(),
+            parent: None,
+        });
+        assert!(matches!(
+            result,
+            Err(SessionError::Organize(OrganizeError::Io { .. }))
+        ));
+        assert!(runtime.organization().is_err());
+        assert_eq!(store.saves.load(Ordering::SeqCst), 0);
     }
 }

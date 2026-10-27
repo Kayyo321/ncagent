@@ -65,6 +65,35 @@ pub enum Action {
     SidebarActivate,
     SidebarActivateAt(usize),
     SidebarScroll(i32),
+    /// Fold (`true`) or unfold the selected folder.
+    SidebarFold(bool),
+    /// A new folder at the top level (`ctrl+f`, the folder button).
+    NewFolder,
+    /// A new folder inside the selected folder, or at the top level (`f` in the sidebar).
+    NewSubfolder,
+    /// Mouse only: the `+` chip of a folder row. Keys: select the row, then `f`.
+    NewSubfolderAt(usize),
+    RenameFolder,
+    /// Mouse only: the rename chip. Keys: select the row, then `r`.
+    RenameFolderAt(usize),
+    DeleteFolder,
+    /// Mouse only: the delete chip. Keys: select the row, then `d`.
+    DeleteFolderAt(usize),
+    /// Pick the selected row up to move it (`m`).
+    PickUp,
+    /// Mouse only: the move chip. Keys: select the row, then `m`.
+    PickUpAt(usize),
+    /// Pick-up mode: step to the next allowed destination.
+    MoveStep(i32),
+    /// Pick-up mode: drop on the selected destination.
+    MoveDrop,
+    /// The folder-name prompt.
+    PromptEdit(EditOp),
+    PromptSubmit,
+    /// Confirm the folder delete.
+    ConfirmYes,
+    /// Close the prompt, the delete confirmation or pick-up mode.
+    SidebarCancel,
     Approve(ApprovalDecision),
     ApprovalMove(i32),
     ApprovalConfirm,
@@ -84,6 +113,12 @@ pub enum Modal {
     Help,
     Approval,
     Question,
+    /// The folder-name prompt in the sidebar.
+    Prompt,
+    /// The inline delete confirmation in the sidebar.
+    Confirm,
+    /// Pick-up mode: choosing where a conversation or folder goes (D55).
+    Move,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,6 +150,7 @@ fn global(key: &KeyEvent) -> Option<Action> {
         KeyCode::Char('l') if c => Some(Action::Redraw),
         KeyCode::Char('t') if c => Some(Action::ToggleAnimation),
         KeyCode::Char('x') if c => Some(Action::ClearQueue),
+        KeyCode::Char('f') if c => Some(Action::NewFolder),
         KeyCode::Esc => Some(Action::Escape),
         KeyCode::F(1) => Some(Action::ToggleHelp),
         KeyCode::PageUp => Some(Action::PageBy(-1)),
@@ -206,6 +242,34 @@ pub fn map_key(key: &KeyEvent, ctx: &key_ctx_t) -> Option<Action> {
                 _ => editing(key).map(Action::QuestionEdit),
             };
         }
+        Modal::Prompt => {
+            return match key.code {
+                KeyCode::Enter if !alt(key) => Some(Action::PromptSubmit),
+                KeyCode::Tab | KeyCode::BackTab => None,
+                _ => editing(key)
+                    .filter(|op| !matches!(op, EditOp::Newline | EditOp::Up | EditOp::Down))
+                    .map(Action::PromptEdit),
+            };
+        }
+        Modal::Confirm => {
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('y') if !c => Some(Action::ConfirmYes),
+                KeyCode::Char('n') if !c => Some(Action::SidebarCancel),
+                KeyCode::Char('?') => Some(Action::ToggleHelp),
+                _ => None,
+            };
+        }
+        Modal::Move => {
+            return match key.code {
+                KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveStep(1)),
+                KeyCode::Up | KeyCode::Char('k') => Some(Action::MoveStep(-1)),
+                KeyCode::Enter | KeyCode::Char(' ') => Some(Action::MoveDrop),
+                KeyCode::Left | KeyCode::Char('h') => Some(Action::SidebarFold(true)),
+                KeyCode::Right | KeyCode::Char('l') => Some(Action::SidebarFold(false)),
+                KeyCode::Char('?') => Some(Action::ToggleHelp),
+                _ => None,
+            };
+        }
         Modal::None => {}
     }
     match ctx.focus {
@@ -244,7 +308,13 @@ pub fn map_key(key: &KeyEvent, ctx: &key_ctx_t) -> Option<Action> {
             KeyCode::Down | KeyCode::Char('j') => Some(Action::SidebarMove(1)),
             KeyCode::Up | KeyCode::Char('k') => Some(Action::SidebarMove(-1)),
             KeyCode::Enter | KeyCode::Char(' ') => Some(Action::SidebarActivate),
+            KeyCode::Left | KeyCode::Char('h') => Some(Action::SidebarFold(true)),
+            KeyCode::Right | KeyCode::Char('l') => Some(Action::SidebarFold(false)),
             KeyCode::Char('n') => Some(Action::NewChat),
+            KeyCode::Char('f') => Some(Action::NewSubfolder),
+            KeyCode::Char('r') => Some(Action::RenameFolder),
+            KeyCode::Char('d') | KeyCode::Delete => Some(Action::DeleteFolder),
+            KeyCode::Char('m') => Some(Action::PickUp),
             KeyCode::Char('i') => Some(Action::SetFocus(Focus::Input)),
             KeyCode::Char('?') => Some(Action::ToggleHelp),
             _ => None,
@@ -258,6 +328,10 @@ pub enum Target {
     Action(Action),
     /// The scrollbar track: the action depends on the row pressed.
     Scrollbar,
+    /// A row of the sidebar's conversation tree, by item index. A press grabs it: a release on
+    /// the same row is a click (open or fold), and a drag to another row moves it (D55). The
+    /// "conversations" label is the row of the top level.
+    Row(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -299,12 +373,28 @@ impl hit_registry_t {
             .find(|h| h.rect.contains(Position::new(x, y)))
     }
 
-    /// Every rectangle whose action is `action`.
+    /// The topmost rectangle whose action is `action`.
     pub fn find(&self, action: &Action) -> Option<Rect> {
-        self.hits.iter().rev().find_map(|h| match &h.target {
-            Target::Action(a) if a == action => Some(h.rect),
+        self.find_target(&Target::Action(action.clone()))
+    }
+
+    /// The topmost rectangle with this target.
+    pub fn find_target(&self, target: &Target) -> Option<Rect> {
+        self.hits
+            .iter()
+            .rev()
+            .find_map(|h| (h.target == *target).then_some(h.rect))
+    }
+
+    /// The sidebar row under a point, if the topmost target there is a row.
+    pub fn row_at(&self, x: u16, y: u16) -> Option<usize> {
+        match self.at(x, y) {
+            Some(hit_t {
+                target: Target::Row(index),
+                ..
+            }) => Some(*index),
             _ => None,
-        })
+        }
     }
 }
 
@@ -326,6 +416,12 @@ pub enum MouseIntent {
     Drag(Action),
     EndDrag,
     Hover(u16, u16),
+    /// A press on a sidebar row: the row is grabbed until the release.
+    Grab(usize),
+    /// The pointer moved with the button held, outside a scrollbar drag.
+    DragAt(u16, u16),
+    /// The button went up, outside a scrollbar drag.
+    Release(u16, u16),
     Nothing,
 }
 
@@ -346,15 +442,19 @@ pub fn map_mouse(
                 target: Target::Action(action),
                 ..
             }) => MouseIntent::Act(action.clone()),
+            Some(hit_t {
+                target: Target::Row(index),
+                ..
+            }) => MouseIntent::Grab(*index),
             None => MouseIntent::Nothing,
         },
         MouseEventKind::Drag(MouseButton::Left) => match dragging {
             Some(track) => MouseIntent::Drag(scrollbar_action(track, y)),
-            None => MouseIntent::Nothing,
+            None => MouseIntent::DragAt(x, y),
         },
         MouseEventKind::Up(_) => match dragging {
             Some(_) => MouseIntent::EndDrag,
-            None => MouseIntent::Nothing,
+            None => MouseIntent::Release(x, y),
         },
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let delta = if event.kind == MouseEventKind::ScrollUp {
@@ -395,7 +495,15 @@ mod tests {
 
     #[test]
     fn globals_win_everywhere() {
-        for modal in [Modal::None, Modal::Help, Modal::Approval, Modal::Question] {
+        for modal in [
+            Modal::None,
+            Modal::Help,
+            Modal::Approval,
+            Modal::Question,
+            Modal::Prompt,
+            Modal::Confirm,
+            Modal::Move,
+        ] {
             for focus in [Focus::Input, Focus::Transcript, Focus::Sidebar] {
                 let c = ctx(focus, modal);
                 assert_eq!(
@@ -544,6 +652,115 @@ mod tests {
         assert_eq!(
             map_key(&key(KeyCode::Char('n'), KeyModifiers::NONE), &s),
             Some(Action::NewChat)
+        );
+    }
+
+    #[test]
+    fn folder_keys() {
+        let s = ctx(Focus::Sidebar, Modal::None);
+        let k = |code| map_key(&key(code, KeyModifiers::NONE), &s);
+        assert_eq!(k(KeyCode::Char('f')), Some(Action::NewSubfolder));
+        assert_eq!(k(KeyCode::Char('r')), Some(Action::RenameFolder));
+        assert_eq!(k(KeyCode::Char('d')), Some(Action::DeleteFolder));
+        assert_eq!(k(KeyCode::Delete), Some(Action::DeleteFolder));
+        assert_eq!(k(KeyCode::Char('m')), Some(Action::PickUp));
+        assert_eq!(k(KeyCode::Left), Some(Action::SidebarFold(true)));
+        assert_eq!(k(KeyCode::Right), Some(Action::SidebarFold(false)));
+        for focus in [Focus::Input, Focus::Transcript, Focus::Sidebar] {
+            assert_eq!(
+                map_key(
+                    &key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+                    &ctx(focus, Modal::None)
+                ),
+                Some(Action::NewFolder)
+            );
+        }
+        // The input keeps plain letters.
+        assert_eq!(
+            map_key(
+                &key(KeyCode::Char('f'), KeyModifiers::NONE),
+                &ctx(Focus::Input, Modal::None)
+            ),
+            Some(Action::Edit(EditOp::Insert('f')))
+        );
+
+        let p = ctx(Focus::Sidebar, Modal::Prompt);
+        let k = |code, m| map_key(&key(code, m), &p);
+        assert_eq!(
+            k(KeyCode::Char('j'), KeyModifiers::NONE),
+            Some(Action::PromptEdit(EditOp::Insert('j')))
+        );
+        assert_eq!(
+            k(KeyCode::Enter, KeyModifiers::NONE),
+            Some(Action::PromptSubmit)
+        );
+        assert_eq!(k(KeyCode::Char('j'), KeyModifiers::CONTROL), None);
+        assert_eq!(k(KeyCode::Up, KeyModifiers::NONE), None);
+        assert_eq!(
+            k(KeyCode::Backspace, KeyModifiers::NONE),
+            Some(Action::PromptEdit(EditOp::Backspace))
+        );
+
+        let c = ctx(Focus::Sidebar, Modal::Confirm);
+        let k = |code| map_key(&key(code, KeyModifiers::NONE), &c);
+        assert_eq!(k(KeyCode::Enter), Some(Action::ConfirmYes));
+        assert_eq!(k(KeyCode::Char('y')), Some(Action::ConfirmYes));
+        assert_eq!(k(KeyCode::Char('n')), Some(Action::SidebarCancel));
+        assert_eq!(k(KeyCode::Char('d')), None);
+
+        let m = ctx(Focus::Sidebar, Modal::Move);
+        let k = |code| map_key(&key(code, KeyModifiers::NONE), &m);
+        assert_eq!(k(KeyCode::Char('j')), Some(Action::MoveStep(1)));
+        assert_eq!(k(KeyCode::Up), Some(Action::MoveStep(-1)));
+        assert_eq!(k(KeyCode::Enter), Some(Action::MoveDrop));
+        assert_eq!(k(KeyCode::Char('x')), None);
+    }
+
+    #[test]
+    fn row_targets_grab_and_release() {
+        let mut hits = hit_registry_t::default();
+        hits.add_target(Rect::new(60, 5, 20, 1), Target::Row(3));
+        hits.add(Rect::new(76, 5, 3, 1), Action::PickUpAt(3));
+        let ev = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let side = Rect::new(60, 0, 20, 20);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(
+            map_mouse(&ev(down, 62, 5), &hits, None, side),
+            MouseIntent::Grab(3)
+        );
+        // A chip on the row sits on top of it.
+        assert_eq!(
+            map_mouse(&ev(down, 77, 5), &hits, None, side),
+            MouseIntent::Act(Action::PickUpAt(3))
+        );
+        assert_eq!(
+            map_mouse(
+                &ev(MouseEventKind::Drag(MouseButton::Left), 61, 9),
+                &hits,
+                None,
+                side
+            ),
+            MouseIntent::DragAt(61, 9)
+        );
+        assert_eq!(
+            map_mouse(
+                &ev(MouseEventKind::Up(MouseButton::Left), 61, 9),
+                &hits,
+                None,
+                side
+            ),
+            MouseIntent::Release(61, 9)
+        );
+        assert_eq!(hits.row_at(62, 5), Some(3));
+        assert_eq!(hits.row_at(77, 5), None);
+        assert_eq!(
+            hits.find_target(&Target::Row(3)),
+            Some(Rect::new(60, 5, 20, 1))
         );
     }
 

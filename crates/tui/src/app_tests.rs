@@ -23,24 +23,25 @@ use ratatui::style::Color;
 use crate::app::{EscapeDelayMs, app_options_t, app_t};
 use crate::canvas::buffer_lines;
 use crate::draw::draw;
+use crate::folder_tests::{file_saved_in_research, folder_index, seed_research};
 use crate::input::{Action, Focus, Modal, Target};
 use crate::scripted::{ScriptCall, preview_info, script_handle_t, scripted_runtime_t};
 use crate::theme::ColorMode;
 use crate::view_model::tests::{call_end, call_start, full_session, level_done, session_start};
 
-struct rig_t {
-    rt: Arc<scripted_runtime_t>,
-    app: app_t,
-    term: Terminal<TestBackend>,
-    clock: u64,
+pub(crate) struct rig_t {
+    pub(crate) rt: Arc<scripted_runtime_t>,
+    pub(crate) app: app_t,
+    pub(crate) term: Terminal<TestBackend>,
+    pub(crate) clock: u64,
 }
 
 impl rig_t {
-    fn new(width: u16, height: u16, animate: bool) -> Self {
+    pub(crate) fn new(width: u16, height: u16, animate: bool) -> Self {
         Self::with(width, height, animate, true, |_| {})
     }
 
-    fn with(
+    pub(crate) fn with(
         width: u16,
         height: u16,
         animate: bool,
@@ -72,49 +73,49 @@ impl rig_t {
         rig
     }
 
-    fn handle(&self, i: usize) -> script_handle_t {
+    pub(crate) fn handle(&self, i: usize) -> script_handle_t {
         self.rt.handle(i).unwrap_or_else(|| panic!("no handle {i}"))
     }
 
-    fn push(&mut self, events: Vec<SessionEvent>) {
+    pub(crate) fn push(&mut self, events: Vec<SessionEvent>) {
         self.handle(self.app.active).push(events);
         self.frame();
     }
 
-    fn advance(&mut self, ms: u64) {
+    pub(crate) fn advance(&mut self, ms: u64) {
         self.clock += ms;
         self.frame();
     }
 
-    fn frame(&mut self) -> Vec<String> {
+    pub(crate) fn frame(&mut self) -> Vec<String> {
         self.app.tick(self.clock, 10_000_000 + self.clock);
         let app = &mut self.app;
         let _ = self.term.draw(|f| draw(app, f));
         buffer_lines(self.term.backend().buffer())
     }
 
-    fn screen(&self) -> String {
+    pub(crate) fn screen(&self) -> String {
         buffer_lines(self.term.backend().buffer()).join("\n")
     }
 
-    fn resize(&mut self, w: u16, h: u16) {
+    pub(crate) fn resize(&mut self, w: u16, h: u16) {
         self.term.backend_mut().resize(w, h);
         let _ = self.term.resize(Rect::new(0, 0, w, h));
         self.app.handle_event(&Event::Resize(w, h));
         self.frame();
     }
 
-    fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
+    pub(crate) fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
         self.app
             .handle_event(&Event::Key(KeyEvent::new(code, mods)));
         self.frame();
     }
 
-    fn ch(&mut self, c: char) {
+    pub(crate) fn ch(&mut self, c: char) {
         self.key(KeyCode::Char(c), KeyModifiers::NONE);
     }
 
-    fn typed(&mut self, s: &str) {
+    pub(crate) fn typed(&mut self, s: &str) {
         for c in s.chars() {
             self.app.handle_event(&Event::Key(KeyEvent::new(
                 KeyCode::Char(c),
@@ -124,7 +125,7 @@ impl rig_t {
         self.frame();
     }
 
-    fn mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
+    pub(crate) fn mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
         self.app.handle_event(&Event::Mouse(MouseEvent {
             kind,
             column: x,
@@ -134,29 +135,90 @@ impl rig_t {
         self.frame();
     }
 
-    fn click(&mut self, x: u16, y: u16) {
+    pub(crate) fn click(&mut self, x: u16, y: u16) {
         self.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
         self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
     }
 
-    fn rect_of(&self, action: &Action) -> Rect {
+    pub(crate) fn rect_of(&self, action: &Action) -> Rect {
         self.app
             .hits
             .find(action)
             .unwrap_or_else(|| panic!("no hit target for {action:?}\n{}", self.screen()))
     }
 
-    fn click_action(&mut self, action: &Action) {
+    pub(crate) fn click_action(&mut self, action: &Action) {
         let r = self.rect_of(action);
         self.click(r.x, r.y);
     }
 
-    fn calls(&self) -> Vec<ScriptCall> {
+    pub(crate) fn calls(&self) -> Vec<ScriptCall> {
         self.handle(self.app.active).calls()
+    }
+
+    /// The rectangle of sidebar row `index` in the last frame.
+    pub(crate) fn row_rect(&self, index: usize) -> Rect {
+        self.app
+            .hits
+            .find_target(&Target::Row(index))
+            .unwrap_or_else(|| panic!("row {index} is not drawn\n{}", self.screen()))
+    }
+
+    /// Move the pointer over sidebar row `index`, so its chips show.
+    pub(crate) fn hover_row(&mut self, index: usize) {
+        let r = self.row_rect(index);
+        self.mouse(MouseEventKind::Moved, r.x + 3, r.y);
+    }
+
+    /// Focus the sidebar and walk the selection to row `index` with `j` and `k`.
+    pub(crate) fn select_by_keys(&mut self, index: usize) {
+        if self.app.focus != Focus::Sidebar {
+            self.app.apply(Action::SetFocus(Focus::Sidebar));
+            self.frame();
+        }
+        for _ in 0..80 {
+            let sel = self.app.sidebar_sel;
+            if sel == index {
+                return;
+            }
+            self.ch(if sel > index { 'k' } else { 'j' });
+        }
+        panic!("could not select row {index}\n{}", self.screen());
+    }
+
+    /// Pick-up mode: step with `j` and `k` until row `index` is the destination.
+    pub(crate) fn choose_destination(&mut self, index: usize) {
+        for _ in 0..80 {
+            let sel = self.app.sidebar_sel;
+            if sel == index {
+                return;
+            }
+            self.ch(if sel > index { 'k' } else { 'j' });
+        }
+        panic!(
+            "row {index} is not an allowed destination\n{}",
+            self.screen()
+        );
+    }
+
+    /// Press on row `from`, drag to row `to`, release there.
+    pub(crate) fn drag_rows(&mut self, from: usize, to: usize) {
+        let a = self.row_rect(from);
+        self.mouse(MouseEventKind::Down(MouseButton::Left), a.x + 3, a.y);
+        let b = self.row_rect(to);
+        self.mouse(MouseEventKind::Drag(MouseButton::Left), b.x + 3, b.y);
+        let b = self.row_rect(to);
+        self.mouse(MouseEventKind::Up(MouseButton::Left), b.x + 3, b.y);
+    }
+
+    /// Press and release on sidebar row `index`.
+    pub(crate) fn click_row(&mut self, index: usize) {
+        let r = self.row_rect(index);
+        self.click(r.x + 3, r.y);
     }
 }
 
-fn start_turn(user: &str) -> Vec<SessionEvent> {
+pub(crate) fn start_turn(user: &str) -> Vec<SessionEvent> {
     vec![
         session_start(),
         SessionEvent::TurnStart { turn: 1 },
@@ -663,18 +725,161 @@ fn keyboard_parity_table() {
             setup: |_| {},
             mouse: |r| {
                 let index = saved_index(r);
-                r.click_action(&Action::SidebarActivateAt(index));
+                r.click_row(index);
             },
             keys: |r| {
                 let index = saved_index(r);
                 r.app.apply(Action::SetFocus(Focus::Sidebar));
                 r.frame();
-                for _ in 0..index {
+                for _ in 0..40 {
+                    if r.app.sidebar_sel == index {
+                        break;
+                    }
                     r.ch('j');
                 }
                 r.key(KeyCode::Enter, KeyModifiers::NONE);
             },
             observe: |r| format!("{:?}", r.app.active().map(|s| s.session.id().to_string())),
+        },
+        case_t {
+            name: "+ folder button / ctrl+f",
+            setup: noop,
+            mouse: |r| r.click_action(&Action::NewFolder),
+            keys: |r| r.key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            observe: |r| format!("{:?} {:?}", r.app.prompt, r.app.focus),
+        },
+        case_t {
+            name: "folder + chip / select and f",
+            setup: seed_research,
+            mouse: |r| {
+                let i = folder_index(r, "Research");
+                r.hover_row(i);
+                r.click_action(&Action::NewSubfolderAt(i));
+            },
+            keys: |r| {
+                let i = folder_index(r, "Research");
+                r.select_by_keys(i);
+                r.ch('f');
+            },
+            observe: |r| format!("{:?}", r.app.prompt),
+        },
+        case_t {
+            name: "rename chip / select and r",
+            setup: seed_research,
+            mouse: |r| {
+                let i = folder_index(r, "Research");
+                r.hover_row(i);
+                r.click_action(&Action::RenameFolderAt(i));
+            },
+            keys: |r| {
+                let i = folder_index(r, "Research");
+                r.select_by_keys(i);
+                r.ch('r');
+            },
+            observe: |r| format!("{:?}", r.app.prompt),
+        },
+        case_t {
+            name: "delete chip / select and d",
+            setup: seed_research,
+            mouse: |r| {
+                let i = folder_index(r, "Research");
+                r.hover_row(i);
+                r.click_action(&Action::DeleteFolderAt(i));
+            },
+            keys: |r| {
+                let i = folder_index(r, "Research");
+                r.select_by_keys(i);
+                r.ch('d');
+            },
+            observe: |r| format!("{:?}", r.app.confirm),
+        },
+        case_t {
+            name: "delete confirm button / enter",
+            setup: |r| {
+                seed_research(r);
+                let i = folder_index(r, "Research");
+                r.select_by_keys(i);
+                r.ch('d');
+            },
+            mouse: |r| r.click_action(&Action::ConfirmYes),
+            keys: |r| r.key(KeyCode::Enter, KeyModifiers::NONE),
+            observe: |r| format!("{:?}", r.app.organization),
+        },
+        case_t {
+            name: "prompt cancel hint / esc",
+            setup: |r| r.key(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            mouse: |r| r.click_action(&Action::SidebarCancel),
+            keys: |r| {
+                r.key(KeyCode::Esc, KeyModifiers::NONE);
+                r.advance(EscapeDelayMs);
+            },
+            observe: |r| format!("{:?}", r.app.prompt),
+        },
+        case_t {
+            name: "move chip / select and m",
+            setup: seed_research,
+            mouse: |r| {
+                let i = saved_index(r);
+                r.hover_row(i);
+                r.click_action(&Action::PickUpAt(i));
+            },
+            keys: |r| {
+                let i = saved_index(r);
+                r.select_by_keys(i);
+                r.ch('m');
+            },
+            observe: |r| format!("{:?} {}", r.app.pickup, r.app.sidebar_sel),
+        },
+        case_t {
+            name: "drag onto a folder / m, choose, enter",
+            setup: seed_research,
+            mouse: |r| {
+                let from = saved_index(r);
+                let to = folder_index(r, "Research");
+                r.drag_rows(from, to);
+            },
+            keys: |r| {
+                let from = saved_index(r);
+                r.select_by_keys(from);
+                r.ch('m');
+                let to = folder_index(r, "Research");
+                r.choose_destination(to);
+                r.key(KeyCode::Enter, KeyModifiers::NONE);
+            },
+            observe: |r| format!("{:?}", r.app.organization.folder_of("saved-1")),
+        },
+        case_t {
+            name: "drag onto conversations / m, choose top level, enter",
+            setup: |r| {
+                seed_research(r);
+                file_saved_in_research(r);
+            },
+            mouse: |r| {
+                let from = saved_index(r);
+                r.drag_rows(from, 1);
+            },
+            keys: |r| {
+                let from = saved_index(r);
+                r.select_by_keys(from);
+                r.ch('m');
+                r.choose_destination(1);
+                r.key(KeyCode::Enter, KeyModifiers::NONE);
+            },
+            observe: |r| format!("{:?}", r.app.organization.folder_of("saved-1")),
+        },
+        case_t {
+            name: "folder row click / select and enter",
+            setup: seed_research,
+            mouse: |r| {
+                let i = folder_index(r, "Research");
+                r.click_row(i);
+            },
+            keys: |r| {
+                let i = folder_index(r, "Research");
+                r.select_by_keys(i);
+                r.key(KeyCode::Enter, KeyModifiers::NONE);
+            },
+            observe: |r| format!("{:?}", r.app.folded),
         },
     ];
     for case in cases {
@@ -722,7 +927,7 @@ fn tool_block_id(r: &rig_t) -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-fn saved_index(r: &rig_t) -> usize {
+pub(crate) fn saved_index(r: &rig_t) -> usize {
     r.app
         .sidebar_items
         .iter()
@@ -740,7 +945,8 @@ fn every_click_target_has_a_keyboard_path() {
     rig.ch('/');
     for hit in &rig.app.hits.hits {
         let ok = match &hit.target {
-            Target::Scrollbar => true,
+            // Sidebar rows: j k and enter, or m to move (the folder tests cover each).
+            Target::Scrollbar | Target::Row(_) => true,
             Target::Action(a) => matches!(
                 a,
                 Action::NewChat
@@ -761,6 +967,17 @@ fn every_click_target_has_a_keyboard_path() {
                     | Action::QuestionSubmit
                     | Action::ToggleSelected
                     | Action::SidebarActivate
+                    | Action::NewFolder
+                    | Action::NewSubfolder
+                    | Action::NewSubfolderAt(_)
+                    | Action::RenameFolderAt(_)
+                    | Action::DeleteFolderAt(_)
+                    | Action::PickUp
+                    | Action::PickUpAt(_)
+                    | Action::MoveDrop
+                    | Action::PromptSubmit
+                    | Action::ConfirmYes
+                    | Action::SidebarCancel
             ),
         };
         assert!(ok, "click target without a keyboard path: {:?}", hit.target);
@@ -994,7 +1211,7 @@ fn saved_session_opens_from_the_sidebar_settled() {
     });
     assert!(rig.screen().contains("please approve"), "{}", rig.screen());
     let index = saved_index(&rig);
-    rig.click_action(&Action::SidebarActivateAt(index));
+    rig.click_row(index);
     assert_eq!(
         rig.app
             .active()
@@ -1222,6 +1439,85 @@ fn sticky_label_names_the_speaker_of_the_top_line() {
     let top = rig.screen().lines().next().unwrap_or("").to_string();
     assert!(top.contains("you · turn 1"), "{top}");
     assert!(top.contains("continued"), "{top}");
+}
+
+/// The screen row of the logo's second row and its column, in a settled frame.
+fn logo_row(screen: &str) -> (usize, usize) {
+    let want = crate::banner::logo_rows()[1].clone();
+    screen
+        .lines()
+        .enumerate()
+        .find_map(|(i, l)| l.find(&want).map(|b| (i, l[..b].chars().count())))
+        .unwrap_or_else(|| panic!("no logo\n{screen}"))
+}
+
+#[test]
+fn startup_logo_reveals_left_to_right_then_equals_the_static_card() {
+    let still = rig_t::new(140, 40, false);
+    let still_screen = still.screen();
+    let (y, x) = logo_row(&still_screen);
+    let still_line: Vec<char> = still_screen.lines().nth(y).unwrap_or("").chars().collect();
+
+    let mut rig = rig_t::new(140, 40, true);
+    let first: Vec<char> = rig.screen().lines().nth(y).unwrap_or("").chars().collect();
+    assert_ne!(
+        first, still_line,
+        "the first frame is the effect, not the card"
+    );
+    assert!(
+        rig.app
+            .active()
+            .is_some_and(|s| s.view.any_live(&s.transcript))
+    );
+    rig.advance(450);
+    let mid: Vec<char> = rig.screen().lines().nth(y).unwrap_or("").chars().collect();
+    assert_eq!(
+        mid[x..x + 13],
+        still_line[x..x + 13],
+        "the left is sharp first"
+    );
+    assert_ne!(mid, still_line, "the right is still settling");
+    rig.advance(550);
+    // Settled: the whole frame, styles included, is today's static card.
+    assert_eq!(rig.screen(), still_screen);
+    assert_eq!(
+        rig.term.backend().buffer().content,
+        still.term.backend().buffer().content
+    );
+    assert!(rig.app.active().is_some_and(|s| s.logo_from.is_none()));
+}
+
+#[test]
+fn logo_reveal_is_skipped_without_animation_or_off_screen() {
+    // Instant mode: the first frame is the card.
+    let rig = rig_t::new(140, 40, false);
+    assert!(rig.app.active().is_some_and(|s| s.logo_from.is_none()));
+    logo_row(&rig.screen());
+    // Turning the effect off mid-reveal settles it at once.
+    let mut rig = rig_t::new(140, 40, true);
+    rig.advance(100);
+    rig.key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    logo_row(&rig.screen());
+    // A card scrolled out of view stops its reveal, so it never plays off screen.
+    let mut rig = rig_t::new(140, 40, true);
+    let mut events = vec![session_start()];
+    for turn in 1..=30u32 {
+        events.push(SessionEvent::TurnStart { turn });
+        events.push(SessionEvent::UserMessage {
+            turn,
+            text: format!("message {turn}"),
+            from_queue: false,
+        });
+    }
+    rig.push(events);
+    assert!(rig.app.active().is_some_and(|s| s.logo_from.is_none()));
+    rig.key(KeyCode::Home, KeyModifiers::CONTROL);
+    logo_row(&rig.screen());
+    // A new chat plays it again for its own card.
+    let mut rig = rig_t::new(140, 40, true);
+    rig.advance(2_000);
+    rig.key(KeyCode::Char('n'), KeyModifiers::CONTROL);
+    assert!(rig.app.active().is_some_and(|s| s.logo_from.is_some()));
 }
 
 #[test]

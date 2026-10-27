@@ -265,7 +265,13 @@ pub fn draw(app: &mut app_t, frame: &mut Frame<'_>) {
         return;
     }
     let inner = dock_inner(first.main.width);
-    let widget = match modal {
+    // The dock follows the approval or question even while a sidebar prompt has the keys.
+    let dock_modal = if modal == Modal::Help {
+        Modal::Help
+    } else {
+        app.pending_modal()
+    };
+    let widget = match dock_modal {
         Modal::Approval => approval_widget(app, inner),
         Modal::Question => question_widget(app, inner),
         _ => None,
@@ -351,6 +357,7 @@ fn draw_transcript(app: &mut app_t, buf: &mut Buffer, area: Rect, scrollbar: Rec
         clock,
         animate,
         info,
+        logo_start: live.logo_from,
     };
     let previous_total = live.scroll.total;
     live.view.prepare(&live.transcript, &ctx);
@@ -372,6 +379,29 @@ fn draw_transcript(app: &mut app_t, buf: &mut Buffer, area: Rect, scrollbar: Rec
     }
     live.scroll.top = live.scroll.top.min(live.scroll.max_top());
     let top = live.scroll.top;
+    // The logo reveal plays once, and only while the card is on screen (D56). Once it is over
+    // or scrolled away the card is drawn settled, with the same rows, so nothing jumps.
+    if let Some(from) = live.logo_from {
+        let over = !animate || clock >= from.saturating_add(crate::effect::RevealMs);
+        let on_screen = live
+            .transcript
+            .blocks
+            .iter()
+            .position(|b| matches!(b.kind, crate::view_model::BlockKind::Banner))
+            .and_then(|i| {
+                let start = *live.view.starts.get(i)?;
+                let rows = live
+                    .view
+                    .rows_of(live.transcript.blocks.get(i)?.id)?
+                    .rows
+                    .len();
+                Some(start < top.saturating_add(viewport) && start.saturating_add(rows) > top)
+            })
+            .unwrap_or(false);
+        if over || !on_screen {
+            live.logo_from = None;
+        }
+    }
     let selected = if focus == Focus::Transcript {
         live.selected_block
     } else {
@@ -835,25 +865,72 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
         }
         _ => ("◉", "ncagent's turn", mix(theme.ice_deep, theme.ice, pulse)),
     };
-    let mut x = put_str(buf, x0, area.y, right, dot, Style::new().fg(color));
-    x = put_str(
-        buf,
-        x.saturating_add(1),
-        area.y,
-        right,
-        who,
-        Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
-    );
-    if phase != SessionPhase::Idle {
-        let text = format!(" · {}", app.phase_text());
-        x = put_str(buf, x, area.y, right, &text, Style::new().fg(theme.fg_dim));
+    let moving = app.moving_title();
+    let mut x = if let Some(title) = &moving {
+        // A move in progress names what moves, where the turn state usually is.
+        let nx = put_str(buf, x0, area.y, right, "⇢", Style::new().fg(theme.ice));
+        let nx = put_str(
+            buf,
+            nx.saturating_add(1),
+            area.y,
+            right,
+            "moving ",
+            Style::new().fg(theme.fg_dim),
+        );
+        put_str(
+            buf,
+            nx,
+            area.y,
+            right,
+            &truncate(title, 28),
+            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        put_str(buf, x0, area.y, right, dot, Style::new().fg(color))
+    };
+    if moving.is_none() {
+        x = put_str(
+            buf,
+            x.saturating_add(1),
+            area.y,
+            right,
+            who,
+            Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+        );
+        if phase != SessionPhase::Idle {
+            let text = format!(" · {}", app.phase_text());
+            x = put_str(buf, x, area.y, right, &text, Style::new().fg(theme.fg_dim));
+        }
     }
     let left_end = x.saturating_add(2);
 
     let modal = app.modal();
     let busy = app.busy();
     let mut hints: Vec<(&str, &str, Option<Action>)> = Vec::new();
+    let dragging_row = app.grab.as_ref().is_some_and(|g| g.moved);
+    let sidebar_modal = matches!(modal, Modal::Prompt | Modal::Confirm | Modal::Move);
     match (modal, app.focus) {
+        _ if dragging_row => {
+            hints.push(("release", "on a folder", None));
+            hints.push(("esc", "cancel", None));
+        }
+        (Modal::Prompt, _) => {
+            let verb = match app.prompt.as_ref().map(|p| &p.kind) {
+                Some(crate::folders::PromptKind::Rename { .. }) => "rename",
+                _ => "create",
+            };
+            hints.push(("enter", verb, Some(Action::PromptSubmit)));
+            hints.push(("esc", "cancel", Some(Action::SidebarCancel)));
+        }
+        (Modal::Confirm, _) => {
+            hints.push(("enter", "confirm", Some(Action::ConfirmYes)));
+            hints.push(("esc", "cancel", Some(Action::SidebarCancel)));
+        }
+        (Modal::Move, _) => {
+            hints.push(("j/k", "choose", None));
+            hints.push(("enter", "drop", Some(Action::MoveDrop)));
+            hints.push(("esc", "cancel", Some(Action::SidebarCancel)));
+        }
         (Modal::Approval, _) => {
             hints.push(("y", "once", Some(Action::Approve(ApprovalDecision::Once))));
             hints.push((
@@ -874,8 +951,10 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
             hints.push(("i", "input", Some(Action::SetFocus(Focus::Input))));
         }
         (Modal::None, Focus::Sidebar) => {
-            hints.push(("j/k", "move", None));
+            hints.push(("j/k", "select", None));
             hints.push(("enter", "open", Some(Action::SidebarActivate)));
+            hints.push(("f", "folder", Some(Action::NewSubfolder)));
+            hints.push(("m", "move", Some(Action::PickUp)));
             hints.push(("n", "new", Some(Action::NewChat)));
         }
         (Modal::None, Focus::Input) => {
@@ -887,10 +966,12 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
             }
         }
     }
-    if busy {
+    if busy && !sidebar_modal && !dragging_row {
         hints.push(("esc", "stop", Some(Action::Cancel)));
     }
-    hints.push(("tab", "focus", Some(Action::FocusNext)));
+    if !sidebar_modal && !dragging_row {
+        hints.push(("tab", "focus", Some(Action::FocusNext)));
+    }
     hints.push(("ctrl+b", "sidebar", Some(Action::ToggleSidebar)));
     hints.push(("?", "help", Some(Action::ToggleHelp)));
 
@@ -946,6 +1027,8 @@ fn draw_side(app: &mut app_t, buf: &mut Buffer, area: Rect, drawer: bool) {
     let Some(live) = app.sessions.get(app.active) else {
         return;
     };
+    let overlay = app.overlay();
+    let dragging = app.grab.as_ref().is_some_and(|g| g.moved);
     let input = sidebar_input_t {
         info: &app.info,
         transcript: &live.transcript,
@@ -959,9 +1042,15 @@ fn draw_side(app: &mut app_t, buf: &mut Buffer, area: Rect, drawer: bool) {
         animate: app.animate,
         hover: app.hover,
         drawer,
+        follow: !dragging,
+        hot: app.move_hot(),
+        ghost: if dragging { app.moving_title() } else { None },
+        overlay: overlay.as_ref(),
+        chips: app.options.mouse && app.moving().is_none() && overlay.is_none(),
     };
-    let scroll = draw_sidebar(buf, area, &input, &theme, &mut app.hits);
-    app.sidebar_scroll = scroll;
+    let out = draw_sidebar(buf, area, &input, &theme, &mut app.hits);
+    app.sidebar_scroll = out.scroll;
+    app.sidebar_list = out.list;
     if drawer {
         // A tone edge where the drawer meets the transcript.
         tint(buf, Rect::new(area.x, area.y, 1, area.height), theme.inset);

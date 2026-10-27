@@ -11,6 +11,7 @@ use ncm::backend::{BackendError, capabilities_t, model_identity_t};
 
 use crate::approval::{ApprovalDecision, ApprovalMode};
 use crate::event::stamped_event_t;
+use crate::organize::{OrganizeError, OrganizeOp, organization_t};
 use crate::store::{StoreError, session_summary_t};
 
 /// Where a session is in its turn.
@@ -37,6 +38,7 @@ impl SessionPhase {
 pub enum SessionError {
     Store(StoreError),
     Backend(BackendError),
+    Organize(OrganizeError),
     /// `full` can be selected only on the command line.
     FullRequiresFlag,
     NotFound {
@@ -52,6 +54,7 @@ impl fmt::Display for SessionError {
         match self {
             SessionError::Store(err) => write!(f, "{err}"),
             SessionError::Backend(err) => write!(f, "{err}"),
+            SessionError::Organize(err) => write!(f, "{err}"),
             SessionError::FullRequiresFlag => {
                 write!(
                     f,
@@ -69,6 +72,12 @@ impl std::error::Error for SessionError {}
 impl From<StoreError> for SessionError {
     fn from(err: StoreError) -> Self {
         SessionError::Store(err)
+    }
+}
+
+impl From<OrganizeError> for SessionError {
+    fn from(err: OrganizeError) -> Self {
+        SessionError::Organize(err)
     }
 }
 
@@ -150,4 +159,11 @@ pub trait runtime_t: Send + Sync {
     fn new_session(&self) -> Result<Box<dyn session_t>, SessionError>;
 
     fn open_session(&self, id: &str) -> Result<opened_session_t, SessionError>;
+
+    /// The folders and which conversation is in which (D50).
+    fn organization(&self) -> Result<organization_t, SessionError>;
+
+    /// Applies one change and returns the organisation after it (D53). A refused change returns
+    /// an error and leaves the organisation as it was.
+    fn organize(&self, op: OrganizeOp) -> Result<organization_t, SessionError>;
 }

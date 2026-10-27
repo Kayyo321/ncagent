@@ -11,7 +11,7 @@ use crate::text::{line_t, sanitize, span_t, truncate};
 use crate::theme::theme_t;
 
 /// Keys, as (key, what it does). The parity test checks the mouse table against these.
-pub const Keys: [(&str, &str); 26] = [
+pub const Keys: [(&str, &str); 31] = [
     ("enter", "send the message (queued while a turn runs)"),
     ("ctrl+j · alt+enter", "new line in the message"),
     (
@@ -26,6 +26,7 @@ pub const Keys: [(&str, &str); 26] = [
     ("tab · shift+tab", "move focus: input, transcript, sidebar"),
     ("ctrl+b", "show or hide the sidebar (a drawer when narrow)"),
     ("ctrl+n", "new chat"),
+    ("ctrl+f", "new folder at the top level"),
     ("ctrl+y", "copy the last reply through OSC 52"),
     ("ctrl+x", "clear queued messages"),
     ("ctrl+t", "turn the generation effect on or off"),
@@ -49,7 +50,17 @@ pub const Keys: [(&str, &str); 26] = [
         "expand or fold the selected tool or attempt",
     ),
     ("navigate: g · G · i", "top · latest · back to the input"),
-    ("sidebar: j k enter n", "move · open · new chat"),
+    ("sidebar: j k enter n", "select · open or fold · new chat"),
+    ("sidebar: ← →", "fold · unfold a folder"),
+    (
+        "sidebar: f r d",
+        "new sub-folder · rename · delete folder (contents move up)",
+    ),
+    (
+        "sidebar: m",
+        "pick up a row; j k choose a folder, enter drops, esc cancels",
+    ),
+    ("folder name: enter · esc", "create or rename · cancel"),
     (
         "approval: y a n",
         "allow once · allow for the session · deny",
@@ -61,7 +72,7 @@ pub const Keys: [(&str, &str); 26] = [
     ),
 ];
 
-pub const Mouse: [(&str, &str); 9] = [
+pub const Mouse: [(&str, &str); 12] = [
     (
         "wheel",
         "scroll the transcript or the sidebar under the pointer",
@@ -76,7 +87,16 @@ pub const Mouse: [(&str, &str); 9] = [
     ("question options", "click an option"),
     (
         "sidebar",
-        "click new chat, a project to fold it, a conversation to open it",
+        "click new chat, a folder to fold it, a conversation to open it",
+    ),
+    ("+ folder", "the button beside conversations: a new folder"),
+    (
+        "drag a row",
+        "onto a folder to move it in, onto conversations for the top level",
+    ),
+    (
+        "row chips",
+        "on hover: + sub-folder · ✎ rename · ⇢ move · ✕ delete",
     ),
     ("↓ new chip", "jump to the latest message"),
     (

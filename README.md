@@ -12,7 +12,7 @@ Build with the pinned toolchain (Rust 1.99.1, set by `rust-toolchain.toml`), the
 cargo run -- demo
 ```
 
-Type a trigger word to see a scripted scenario: `tool`, `approve`, `deny`, `shell`, `ask`, `fail`, `error`, `flaky`, `long` or `markdown`. Press `?` for the keys. The options are `--profile standard|compact`, `--speed normal|fast|instant`, `--approval ask|edit|full`, `--seed`, `--state-dir`, `--ephemeral` and `--no-mouse`. Demo sessions are saved as JSON lines in your local data directory, marked as simulated (PROJECT.md, D40). To preview the UI without any backend, run `cargo run -p tui --features preview --example gallery`.
+Type a trigger word to see a scripted scenario: `tool`, `approve`, `deny`, `shell`, `ask`, `fail`, `error`, `flaky`, `long` or `markdown`. Press `?` for the keys. The options are `--profile standard|compact`, `--speed normal|fast|instant`, `--approval ask|edit|full`, `--seed`, `--state-dir`, `--ephemeral` and `--no-mouse`. Demo sessions are saved as JSON lines in your local data directory, marked as simulated (PROJECT.md, D40). Demo folders are saved in `folders.json` next to the demo sessions (PROJECT.md, D50), and `--ephemeral` keeps them in memory. To preview the UI without any backend, run `cargo run -p tui --features preview --example gallery`.
 
 ## What it will do
 

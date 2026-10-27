@@ -2,7 +2,17 @@
 
 ncagent is a command-line agent for Next-Concept Modeling (NCM) models. It runs an NCM model from a local directory and gives it the features of a production coding agent: sessions that resume, tool calls with approvals, compaction, sub-agents, side chats, a terminal interface with mouse support, and a headless mode for editors and apps. It pairs with [ncmorph](https://github.com/Kayyo321/ncmorph), which converts open-weight language models into NCM models.
 
-**Status: not implemented.** This repository holds the specification, [PROJECT.md](PROJECT.md), the working rules, [AGENTS.md](AGENTS.md), and this file. Nothing here builds or runs yet.
+**Status: the agent is not implemented. A UI prototype runs against a simulator.** No NCM model runs in this repository yet. The workspace builds, and `ncagent demo` starts the terminal UI against a scripted, clearly labelled demo backend: its replies and tools are simulated, no model runs and nothing is executed (owner exception O1 in [PROJECT.md](PROJECT.md)). `ncagent chat <model-dir>` returns a named not-implemented error until the engine exists.
+
+## Try the UI prototype
+
+Build with the pinned toolchain (Rust 1.99.1, set by `rust-toolchain.toml`), then run the demo in a terminal:
+
+```bash
+cargo run -- demo
+```
+
+Type a trigger word to see a scripted scenario: `tool`, `approve`, `deny`, `shell`, `ask`, `fail`, `error`, `flaky`, `long` or `markdown`. Press `?` for the keys. The options are `--profile standard|compact`, `--speed normal|fast|instant`, `--approval ask|edit|full`, `--seed`, `--state-dir`, `--ephemeral` and `--no-mouse`. Demo sessions are saved as JSON lines in your local data directory, marked as simulated (PROJECT.md, D40). To preview the UI without any backend, run `cargo run -p tui --features preview --example gallery`.
 
 ## What it will do
 
@@ -53,7 +63,7 @@ The checkpoints are PyTorch pickles, so the binary cannot read them directly. `n
 
 ## Planned commands
 
-These commands do not exist yet. They are the planned interface, from milestone A0 onward.
+`build`, `test` and `demo` work today. `inspect` and `chat` are planned, and return a named error until their milestones are done.
 
 ```bash
 cargo build --release

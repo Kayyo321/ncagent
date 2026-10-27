@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = [
+    ".",
+    "crates/ncm",
+    "crates/harness",
+    "crates/tui",
+    "crates/convert",
+    "crates/demo",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+license = "Apache-2.0"
+
+[package]
+name = "ncagent"
+description = "Command-line agent for Next-Concept Modeling (NCM) models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ncagent"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+ncm = { path = "crates/ncm" }
+harness = { path = "crates/harness" }
+tui = { path = "crates/tui" }
+convert = { path = "crates/convert" }
+demo = { path = "crates/demo" }

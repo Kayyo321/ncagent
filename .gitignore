@@ -1,0 +1,28 @@
+# Build output
+/target/
+
+# Downloaded checkpoints (hf download ... --local-dir artifacts)
+/artifacts/
+
+# Generated export directories
+/exports/
+/export/
+*.export/
+
+# Weights, tokenizers, pickles and datasets (AGENTS.md, "Data and weights")
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.bin
+*.pickle
+*.pkl
+*.onnx
+*.ckpt
+tokenizer.json
+tokenizer.model
+*.tiktoken
+
+# Logs and caches
+*.log
+/.cache/

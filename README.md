@@ -77,10 +77,12 @@ Read [AGENTS.md](AGENTS.md) before you change anything. Every source file starts
 
 ## Credits
 
-ncagent runs models from **Next-Concept Modeling**, developed by Hermann Kumbong, Ishan S. Khare, Iddah Mlauzi, Andrew Woen, Charles Ding, E. Kelly Buchanan, Simran Arora, Azalia Mirhoseini and Christopher Ré in the HazyResearch group at Stanford.
+ncagent builds on **Next-Concept Modeling**, developed by Hermann Kumbong, Ishan S. Khare, Iddah Mlauzi, Andrew Woen, Charles Ding, E. Kelly Buchanan, Simran Arora, Azalia Mirhoseini and Christopher Ré in the HazyResearch group at Stanford.
 
 - Paper: [arXiv:2610.14162](https://arxiv.org/abs/2610.14162)
 - Reference code and checkpoints: [github.com/HazyResearch/ncm](https://github.com/HazyResearch/ncm) (MIT License) and the [NCM collection on Hugging Face](https://huggingface.co/collections/hazyresearch/ncm)
+
+Thank you to the NCM authors. Their research, and their decision to release the paper, code and weights openly, made ncagent possible.
 
 ## License
 

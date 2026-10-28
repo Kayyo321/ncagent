@@ -12,6 +12,7 @@ use ncm::backend::{BackendError, capabilities_t, model_identity_t};
 use crate::approval::{ApprovalDecision, ApprovalMode};
 use crate::event::stamped_event_t;
 use crate::organize::{OrganizeError, OrganizeOp, organization_t};
+use crate::settings::{SettingsError, custom_theme_t, loaded_themes_t, settings_t};
 use crate::store::{StoreError, session_summary_t};
 
 /// Where a session is in its turn.
@@ -39,6 +40,7 @@ pub enum SessionError {
     Store(StoreError),
     Backend(BackendError),
     Organize(OrganizeError),
+    Settings(SettingsError),
     /// `full` can be selected only on the command line.
     FullRequiresFlag,
     NotFound {
@@ -55,6 +57,7 @@ impl fmt::Display for SessionError {
             SessionError::Store(err) => write!(f, "{err}"),
             SessionError::Backend(err) => write!(f, "{err}"),
             SessionError::Organize(err) => write!(f, "{err}"),
+            SessionError::Settings(err) => write!(f, "{err}"),
             SessionError::FullRequiresFlag => {
                 write!(
                     f,
@@ -84,6 +87,12 @@ impl From<OrganizeError> for SessionError {
 impl From<BackendError> for SessionError {
     fn from(err: BackendError) -> Self {
         SessionError::Backend(err)
+    }
+}
+
+impl From<SettingsError> for SessionError {
+    fn from(err: SettingsError) -> Self {
+        SessionError::Settings(err)
     }
 }
 
@@ -166,4 +175,28 @@ pub trait runtime_t: Send + Sync {
     /// Applies one change and returns the organisation after it (D53). A refused change returns
     /// an error and leaves the organisation as it was.
     fn organize(&self, op: OrganizeOp) -> Result<organization_t, SessionError>;
+
+    /// Deletes a conversation: its log, its filing and its settings (D59). It returns the
+    /// organisation after the change. A conversation with no saved log is still forgotten.
+    fn delete_session(&self, id: &str) -> Result<organization_t, SessionError>;
+
+    /// The saved settings, or the defaults when nothing was saved (D63).
+    fn settings(&self) -> Result<settings_t, SessionError>;
+
+    /// Checks and saves the settings, and returns them (D63). Nothing is saved when a value is
+    /// refused.
+    fn set_settings(&self, settings: settings_t) -> Result<settings_t, SessionError>;
+
+    /// The custom themes that load, and the theme files that were skipped (D64).
+    fn themes(&self) -> Result<loaded_themes_t, SessionError>;
+
+    /// Reads and checks a theme file the user names. Saves nothing (D64).
+    fn read_theme_file(&self, path: &str) -> Result<custom_theme_t, SessionError>;
+
+    /// Saves a copy of a theme under its id, replacing one with that id, and returns the themes
+    /// (D64).
+    fn save_theme(&self, theme: custom_theme_t) -> Result<loaded_themes_t, SessionError>;
+
+    /// Removes a custom theme and returns the themes that are left (D64).
+    fn remove_theme(&self, id: &str) -> Result<loaded_themes_t, SessionError>;
 }

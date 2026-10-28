@@ -1,9 +1,11 @@
 /*
  * Ko, (Baczynski-Bruce) 2026; Apache 2.0
 */
-//! Colours in one place (D47). White on black, with background-tone steps instead of borders.
+//! Colours in one place (D47, D64). White on black by default, with background-tone steps
+//! instead of borders. A theme is data: `theme_t` is a set of named colours, the built-in themes
+//! are in `builtin_themes`, and a custom theme sets some of the names (see `theme_set`).
 //! When the terminal lacks 24-bit colour every `Rgb` is mapped to the 256-colour palette at the
-//! end of each frame, so the rest of the crate always speaks `Rgb`.
+//! end of each frame, so the rest of the crate always speaks `Rgb`, whatever the theme.
 
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
@@ -109,66 +111,186 @@ pub fn mix(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-/// The palette. Panels are a few steps above black; speakers own a rail colour.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct theme_t {
-    pub bg: Color,
+/// Declares the palette type with its colour names, so the list of names, `get` and `set`
+/// cannot drift from the fields (D64).
+macro_rules! palette_fields {
+    ($($(#[$doc:meta])* $name:ident,)*) => {
+        /// The palette. Panels are a few steps above the background; speakers own a rail colour.
+        /// A theme is data: every field is a named colour that a custom theme may set (D64).
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        pub struct theme_t {
+            $($(#[$doc])* pub $name: Color,)*
+        }
+
+        /// Every colour name of a theme, in field order. These are the keys a custom theme's
+        /// `colors` map may use (D64).
+        pub const ColorNames: &[&str] = &[$(stringify!($name)),*];
+
+        impl theme_t {
+            /// The colour called `name`, or `None` for a name that is not a theme colour.
+            pub fn get(&self, name: &str) -> Option<Color> {
+                match name {
+                    $(stringify!($name) => Some(self.$name),)*
+                    _ => None,
+                }
+            }
+
+            /// Set the colour called `name`. False, and nothing changes, for an unknown name.
+            pub fn set(&mut self, name: &str, color: Color) -> bool {
+                match name {
+                    $(stringify!($name) => {
+                        self.$name = color;
+                        true
+                    })*
+                    _ => false,
+                }
+            }
+        }
+    };
+}
+
+palette_fields! {
+    bg,
     /// Sidebar column.
-    pub side: Color,
+    side,
     /// The user's message panel.
-    pub panel: Color,
+    panel,
     /// Composer and widgets docked at the bottom.
-    pub dock: Color,
+    dock,
     /// Insets inside panels: code blocks, summaries, gauges.
-    pub inset: Color,
-    pub hover: Color,
-    pub select: Color,
-    pub fg: Color,
-    pub fg_dim: Color,
-    pub fg_faint: Color,
-    pub user: Color,
-    pub agent: Color,
-    pub ice: Color,
-    pub ice_deep: Color,
-    pub tool: Color,
-    pub tool_dim: Color,
-    pub approval: Color,
-    pub question: Color,
-    pub error: Color,
-    pub success: Color,
-    pub composer_rail: Color,
-    pub code: Color,
-    pub link: Color,
+    inset,
+    hover,
+    select,
+    /// Rows in a selection of several (D60): a cool tone, apart from hover and the open row.
+    marked,
+    fg,
+    fg_dim,
+    fg_faint,
+    user,
+    agent,
+    ice,
+    ice_deep,
+    tool,
+    tool_dim,
+    approval,
+    question,
+    error,
+    success,
+    composer_rail,
+    code,
+    link,
+    /// The top row of the title card's logo; the rows below blend to `logo_lo`.
+    logo_hi,
+    logo_lo,
+    /// The brightest glyphs of the generation effect, before they settle into `ice`.
+    glint,
+}
+
+/// The colours a theme is built from. Every other colour is derived from these when a custom
+/// theme changes one of its sources and does not set the derived colour itself (D64).
+pub const BaseColors: &[&str] = &[
+    "bg",
+    "fg",
+    "user",
+    "agent",
+    "tool",
+    "approval",
+    "question",
+    "error",
+    "success",
+    "composer_rail",
+    "code",
+];
+
+/// The base colours a derived colour is made from. Empty for a base colour.
+pub fn derived_from(name: &str) -> &'static [&'static str] {
+    match name {
+        "side" | "panel" | "dock" | "inset" | "hover" | "fg_dim" | "fg_faint" => &["bg", "fg"],
+        "select" => &["bg", "fg", "agent"],
+        "marked" | "ice_deep" => &["bg", "agent"],
+        "ice" | "glint" => &["agent", "fg"],
+        "tool_dim" => &["bg", "tool"],
+        "link" => &["agent"],
+        "logo_hi" => &["user"],
+        "logo_lo" => &["agent", "bg"],
+        _ => &[],
+    }
+}
+
+/// The value of a derived colour, from the base colours of `t`. `None` for a base colour or an
+/// unknown name. The steps are fractions of the way from the background to the text, so a light
+/// theme gets darker panels and a dark theme lighter ones.
+pub fn derive(name: &str, t: &theme_t) -> Option<Color> {
+    let toward_fg = |f: f32| mix(t.bg, t.fg, f);
+    let ice = mix(t.agent, t.fg, 0.5);
+    let color = match name {
+        "side" => toward_fg(0.05),
+        "panel" => toward_fg(0.095),
+        "dock" => toward_fg(0.08),
+        "inset" => toward_fg(0.13),
+        "hover" => toward_fg(0.15),
+        "select" => mix(toward_fg(0.16), t.agent, 0.08),
+        "marked" => mix(t.bg, t.agent, 0.2),
+        "fg_dim" => toward_fg(0.6),
+        "fg_faint" => toward_fg(0.36),
+        "ice" => ice,
+        "ice_deep" => mix(t.bg, t.agent, 0.45),
+        "tool_dim" => mix(t.bg, t.tool, 0.55),
+        "link" => t.agent,
+        "logo_hi" => t.user,
+        "logo_lo" => mix(t.agent, t.bg, 0.1),
+        "glint" => mix(ice, t.fg, 0.7),
+        _ => return None,
+    };
+    Some(color)
 }
 
 impl theme_t {
+    /// The default theme, `ncagent-dark` (D47).
     pub fn dark() -> Self {
-        theme_t {
-            bg: Color::Rgb(0, 0, 0),
-            side: Color::Rgb(12, 12, 15),
-            panel: Color::Rgb(22, 22, 27),
-            dock: Color::Rgb(19, 19, 24),
-            inset: Color::Rgb(30, 30, 37),
-            hover: Color::Rgb(34, 34, 42),
-            select: Color::Rgb(40, 40, 52),
-            fg: Color::Rgb(236, 236, 240),
-            fg_dim: Color::Rgb(146, 146, 158),
-            fg_faint: Color::Rgb(84, 84, 96),
-            user: Color::Rgb(250, 250, 252),
-            agent: Color::Rgb(142, 202, 255),
-            ice: Color::Rgb(196, 228, 255),
-            ice_deep: Color::Rgb(58, 92, 128),
-            tool: Color::Rgb(226, 118, 236),
-            tool_dim: Color::Rgb(122, 70, 132),
-            approval: Color::Rgb(255, 182, 72),
-            question: Color::Rgb(252, 212, 112),
-            error: Color::Rgb(255, 94, 98),
-            success: Color::Rgb(112, 228, 152),
-            composer_rail: Color::Rgb(176, 148, 255),
-            code: Color::Rgb(236, 206, 164),
-            link: Color::Rgb(142, 202, 255),
-        }
+        crate::builtin_themes::ncagent_dark()
     }
+
+    /// Every colour name, in field order (D64).
+    pub fn color_names() -> &'static [&'static str] {
+        ColorNames
+    }
+}
+
+/// `#rrggbb` to a colour. `None` for any other text.
+pub fn parse_hex(value: &str) -> Option<Color> {
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |i: usize| {
+        hex.get(i..i + 2)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+    };
+    Some(Color::Rgb(byte(0)?, byte(2)?, byte(4)?))
+}
+
+/// Relative luminance of an RGB colour (WCAG 2.x). Non-RGB colours count as black.
+pub fn luminance(color: Color) -> f64 {
+    let Color::Rgb(r, g, b) = color else {
+        return 0.0;
+    };
+    let channel = |v: u8| {
+        let c = f64::from(v) / 255.0;
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+}
+
+/// The WCAG contrast ratio of two colours, from 1 to 21.
+pub fn contrast_ratio(a: Color, b: Color) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
 }
 
 #[cfg(test)]

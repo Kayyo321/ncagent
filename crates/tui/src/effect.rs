@@ -234,8 +234,7 @@ pub fn texture(
         };
         braille(mix64(h ^ 0xD07), dots)
     };
-    let white = Color::Rgb(246, 249, 255);
-    let base = mix(white, theme.ice, 0.25 + 0.65 * f);
+    let base = mix(theme.glint, theme.ice, 0.25 + 0.65 * f);
     let dim = 0.82 + 0.18 * unit(mix64(h ^ 0xC0));
     let color = mix(theme.bg, base, dim);
     (symbol, color)

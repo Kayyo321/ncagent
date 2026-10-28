@@ -20,5 +20,6 @@ pub mod pack;
 pub mod replay;
 pub mod reply;
 pub mod runtime;
+pub mod settings;
 pub mod store;
 pub mod tools;

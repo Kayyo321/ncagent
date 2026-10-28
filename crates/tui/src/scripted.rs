@@ -23,6 +23,9 @@ use harness::approval::{ApprovalDecision, ApprovalMode, ApprovalSource};
 use harness::backend::{BackendKind, capabilities_t, model_identity_t, sampler_t};
 use harness::event::{CancelScope, ReplyItem, SessionEvent, TurnOutcome, stamped_event_t};
 use harness::organize::{OrganizeOp, organization_t};
+use harness::settings::{
+    custom_theme_t, loaded_themes_t, memory_settings_store_t, settings_store_t, settings_t,
+};
 use harness::store::{session_summary_t, summarize_events};
 use harness::tools::{ApprovalClass, ToolErrorKind, parsed_call_t, tool_arg_t};
 
@@ -780,6 +783,22 @@ pub struct scripted_runtime_t {
     /// When set, `organization` and `organize` return this error, as a store whose file does
     /// not load would (D52).
     organization_error: Mutex<Option<SessionError>>,
+    /// Settings and custom themes, kept with the harness's in-memory store, so its rules apply.
+    settings: memory_settings_store_t,
+    /// When set, `settings` and `set_settings` return this error, as a settings file that does
+    /// not load would (D70).
+    settings_error: Mutex<Option<SessionError>>,
+    /// When set, `delete_session` returns this error and changes nothing.
+    delete_error: Mutex<Option<SessionError>>,
+    /// Every id `delete_session` was asked to delete, oldest first.
+    deleted: Mutex<Vec<String>>,
+    /// Every operation `organize` applied, oldest first.
+    applied: Mutex<Vec<OrganizeOp>>,
+    /// Theme files `read_theme_file` finds, by path, with what reading each gives. Any other
+    /// path is refused by the in-memory store, which reads no files.
+    theme_files: Mutex<Vec<(String, Result<custom_theme_t, SessionError>)>>,
+    /// Theme files `themes` says it skipped.
+    skipped_themes: Mutex<Vec<String>>,
 }
 
 impl scripted_runtime_t {
@@ -792,6 +811,13 @@ impl scripted_runtime_t {
             stored: Mutex::new(Vec::new()),
             organization: Mutex::new(organization_t::new()),
             organization_error: Mutex::new(None),
+            settings: memory_settings_store_t::new(),
+            settings_error: Mutex::new(None),
+            delete_error: Mutex::new(None),
+            deleted: Mutex::new(Vec::new()),
+            applied: Mutex::new(Vec::new()),
+            theme_files: Mutex::new(Vec::new()),
+            skipped_themes: Mutex::new(Vec::new()),
         }
     }
 
@@ -804,6 +830,13 @@ impl scripted_runtime_t {
             stored: Mutex::new(Vec::new()),
             organization: Mutex::new(organization_t::new()),
             organization_error: Mutex::new(None),
+            settings: memory_settings_store_t::new(),
+            settings_error: Mutex::new(None),
+            delete_error: Mutex::new(None),
+            deleted: Mutex::new(Vec::new()),
+            applied: Mutex::new(Vec::new()),
+            theme_files: Mutex::new(Vec::new()),
+            skipped_themes: Mutex::new(Vec::new()),
         }
     }
 
@@ -835,6 +868,85 @@ impl scripted_runtime_t {
 
     fn organization_failure(&self) -> Option<SessionError> {
         self.organization_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Make `settings` and `set_settings` fail with `err`, or work again with `None`.
+    pub fn fail_settings(&self, err: Option<SessionError>) {
+        *self
+            .settings_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = err;
+    }
+
+    /// Make `delete_session` fail with `err`, or work again with `None`.
+    pub fn fail_delete(&self, err: Option<SessionError>) {
+        *self
+            .delete_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = err;
+    }
+
+    /// Save settings directly, for test and gallery setup. The store's rules apply.
+    pub fn seed_settings(&self, settings: &settings_t) -> Result<(), SessionError> {
+        Ok(self.settings.save(settings)?)
+    }
+
+    /// Make `read_theme_file(path)` give `result`, as a file at that path would.
+    pub fn offer_theme_file(&self, path: &str, result: Result<custom_theme_t, SessionError>) {
+        self.theme_files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_string(), result));
+    }
+
+    /// Make `themes` report these files as skipped.
+    pub fn skip_theme_files(&self, files: Vec<String>) {
+        *self
+            .skipped_themes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = files;
+    }
+
+    /// Save a custom theme directly, for test and gallery setup. The store's rules apply.
+    pub fn seed_theme(&self, theme: &custom_theme_t) -> Result<(), SessionError> {
+        Ok(self.settings.save_theme(theme)?)
+    }
+
+    /// The settings as saved now, whatever `fail_settings` says.
+    pub fn saved_settings(&self) -> Result<settings_t, SessionError> {
+        Ok(self.settings.load()?)
+    }
+
+    /// Every id `delete_session` was asked to delete, oldest first.
+    pub fn deleted(&self) -> Vec<String> {
+        self.deleted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every operation `organize` applied, oldest first.
+    pub fn applied(&self) -> Vec<OrganizeOp> {
+        self.applied
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// True when a saved session with this id is held.
+    pub fn is_stored(&self, id: &str) -> bool {
+        self.stored
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|s| s.id == id)
+    }
+
+    fn settings_failure(&self) -> Option<SessionError> {
+        self.settings_error
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -967,7 +1079,94 @@ impl runtime_t for scripted_runtime_t {
         let mut next = held.clone();
         next.apply(&op)?;
         *held = next.clone();
+        self.applied
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(op);
         Ok(next)
+    }
+
+    /// Removes the saved events, then forgets the filing and settings, as the real runtime does
+    /// (D59, D67). A session with nothing saved is still forgotten.
+    fn delete_session(&self, id: &str) -> Result<organization_t, SessionError> {
+        self.deleted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(id.to_string());
+        if let Some(err) = self
+            .delete_error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        {
+            return Err(err);
+        }
+        if let Some(err) = self.organization_failure() {
+            return Err(err);
+        }
+        let mut held = self
+            .organization
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut next = held.clone();
+        next.apply(&OrganizeOp::ForgetSession {
+            session_id: id.to_string(),
+        })?;
+        self.stored
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|s| s.id != id);
+        *held = next.clone();
+        Ok(next)
+    }
+
+    fn settings(&self) -> Result<settings_t, SessionError> {
+        if let Some(err) = self.settings_failure() {
+            return Err(err);
+        }
+        Ok(self.settings.load()?)
+    }
+
+    fn set_settings(&self, settings: settings_t) -> Result<settings_t, SessionError> {
+        if let Some(err) = self.settings_failure() {
+            return Err(err);
+        }
+        self.settings.save(&settings)?;
+        Ok(settings)
+    }
+
+    fn themes(&self) -> Result<loaded_themes_t, SessionError> {
+        let mut loaded = self.settings.list_themes()?;
+        loaded.skipped = self
+            .skipped_themes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        Ok(loaded)
+    }
+
+    fn read_theme_file(&self, path: &str) -> Result<custom_theme_t, SessionError> {
+        let offered = self
+            .theme_files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(p, _)| p == path)
+            .map(|(_, r)| r.clone());
+        match offered {
+            Some(result) => result,
+            None => Ok(self.settings.read_theme_file(std::path::Path::new(path))?),
+        }
+    }
+
+    fn save_theme(&self, theme: custom_theme_t) -> Result<loaded_themes_t, SessionError> {
+        self.settings.save_theme(&theme)?;
+        Ok(self.settings.list_themes()?)
+    }
+
+    fn remove_theme(&self, id: &str) -> Result<loaded_themes_t, SessionError> {
+        self.settings.remove_theme(id)?;
+        Ok(self.settings.list_themes()?)
     }
 }
 

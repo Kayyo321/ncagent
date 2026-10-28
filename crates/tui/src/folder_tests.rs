@@ -18,21 +18,21 @@ use crate::sidebar::{MoveMark, SidebarItemKind};
 use crate::theme::{mix, theme_t};
 use crate::view_model::tests::session_start;
 
-fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
+pub(crate) fn ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
     match result {
         Ok(value) => value,
         Err(err) => panic!("expected Ok, found {err:?}"),
     }
 }
 
-fn create(name: &str, parent: Option<&str>) -> OrganizeOp {
+pub(crate) fn create(name: &str, parent: Option<&str>) -> OrganizeOp {
     OrganizeOp::CreateFolder {
         name: name.into(),
         parent: parent.map(str::to_string),
     }
 }
 
-fn file(session: &str, folder: Option<&str>) -> OrganizeOp {
+pub(crate) fn file(session: &str, folder: Option<&str>) -> OrganizeOp {
     OrganizeOp::MoveSession {
         session_id: session.into(),
         folder: folder.map(str::to_string),
@@ -40,7 +40,7 @@ fn file(session: &str, folder: Option<&str>) -> OrganizeOp {
 }
 
 /// A saved session with one finished turn, its events stamped from `at_ms`.
-fn saved(id: &str, title: &str, at_ms: u64) -> Vec<stamped_event_t> {
+pub(crate) fn saved(id: &str, title: &str, at_ms: u64) -> Vec<stamped_event_t> {
     let mut start = session_start();
     if let SessionEvent::SessionStart { session_id, .. } = &mut start {
         *session_id = id.into();
@@ -73,7 +73,7 @@ fn saved(id: &str, title: &str, at_ms: u64) -> Vec<stamped_event_t> {
 
 /// Research (f1) holding Papers (f2), and Ideas (f3); "attention paper" in Papers, "lab notes"
 /// in Research, "free chat" unfiled.
-fn tree_rig(width: u16, height: u16, mouse: bool) -> rig_t {
+pub(crate) fn tree_rig(width: u16, height: u16, mouse: bool) -> rig_t {
     rig_t::with(width, height, false, mouse, |rt| {
         rt.store("s-paper", saved("s-paper", "attention paper", 3_000));
         rt.store("s-note", saved("s-note", "lab notes", 2_000));
@@ -112,7 +112,7 @@ pub(crate) fn folder_index(r: &rig_t, name: &str) -> usize {
         .unwrap_or_else(|| panic!("no folder {name}: {:?}", r.app.sidebar_items))
 }
 
-fn session_index(r: &rig_t, id: &str) -> usize {
+pub(crate) fn session_index(r: &rig_t, id: &str) -> usize {
     r.app
         .sidebar_items
         .iter()
@@ -121,7 +121,7 @@ fn session_index(r: &rig_t, id: &str) -> usize {
 }
 
 /// Row and column of the first appearance of `needle` on screen, in cells.
-fn locate(r: &rig_t, needle: &str) -> (usize, usize) {
+pub(crate) fn locate(r: &rig_t, needle: &str) -> (usize, usize) {
     let screen = r.screen();
     for (row, line) in screen.lines().enumerate() {
         if let Some(b) = line.find(needle) {
@@ -136,7 +136,7 @@ fn sidebar_bg(drawer: bool) -> Color {
     if drawer { t.dock } else { t.side }
 }
 
-fn cell_bg(r: &rig_t, x: u16, y: u16) -> Color {
+pub(crate) fn cell_bg(r: &rig_t, x: u16, y: u16) -> Color {
     r.term
         .backend()
         .buffer()
@@ -145,7 +145,7 @@ fn cell_bg(r: &rig_t, x: u16, y: u16) -> Color {
         .unwrap_or(Color::Reset)
 }
 
-fn toast(r: &rig_t) -> String {
+pub(crate) fn toast(r: &rig_t) -> String {
     r.app
         .toast
         .as_ref()
@@ -391,12 +391,30 @@ fn rename_with_r_is_prefilled() {
         Some("Thoughts")
     );
     assert!(rig.screen().contains("▾ Thoughts"));
-    // r on a conversation explains itself.
+    // r on a conversation renames the conversation (D57), prefilled with its title.
     let s = session_index(&rig, "s-free");
     rig.select_by_keys(s);
     rig.ch('r');
+    assert_eq!(rig.app.modal(), Modal::Prompt);
+    assert!(
+        rig.screen().contains("rename conversation"),
+        "{}",
+        rig.screen()
+    );
+    assert_eq!(
+        rig.app.prompt.as_ref().map(|p| p.editor.text().to_string()),
+        Some("free chat".to_string())
+    );
+    // On the new-chat button there is nothing to rename.
+    rig.key(KeyCode::Esc, KeyModifiers::NONE);
+    rig.advance(EscapeDelayMs);
+    rig.select_by_keys(0);
+    rig.ch('r');
     assert_eq!(rig.app.modal(), Modal::None);
-    assert_eq!(toast(&rig), "select a folder to rename it");
+    assert_eq!(
+        toast(&rig),
+        "select a folder or a conversation to rename it"
+    );
 }
 
 #[test]
@@ -901,30 +919,9 @@ fn every_folder_click_target_has_a_keyboard_path() {
     rig.key(KeyCode::Char('f'), KeyModifiers::CONTROL);
     seen.extend(rig.app.hits.hits.iter().map(|h| h.target.clone()));
     for target in seen {
-        let ok = match &target {
-            Target::Scrollbar | Target::Row(_) => true,
-            Target::Action(a) => matches!(
-                a,
-                Action::NewChat
-                    | Action::NewFolder
-                    | Action::NewSubfolder
-                    | Action::NewSubfolderAt(_)
-                    | Action::RenameFolderAt(_)
-                    | Action::DeleteFolderAt(_)
-                    | Action::PickUp
-                    | Action::PickUpAt(_)
-                    | Action::ConfirmYes
-                    | Action::SidebarCancel
-                    | Action::PromptSubmit
-                    | Action::SidebarActivate
-                    | Action::ToggleSidebar
-                    | Action::ToggleHelp
-                    | Action::FocusNext
-                    | Action::SetFocus(_)
-                    | Action::SelectBlockId(_)
-                    | Action::Submit
-            ),
-        };
-        assert!(ok, "click target without a keyboard path: {target:?}");
+        assert!(
+            crate::app_tests::keyboard_path(&target),
+            "click target without a keyboard path: {target:?}"
+        );
     }
 }

@@ -1232,6 +1232,13 @@ pub(crate) mod test_support {
                 message: "disk full".to_string(),
             })
         }
+
+        fn delete(&self, id: &str) -> Result<(), StoreError> {
+            Err(StoreError::Io {
+                path: id.to_string(),
+                message: "disk full".to_string(),
+            })
+        }
     }
 
     pub fn runtime_with(

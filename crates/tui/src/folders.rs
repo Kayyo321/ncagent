@@ -12,15 +12,27 @@ use harness::organize::{OrganizeError, OrganizeOp};
 
 use crate::app::{ToastKind, app_t};
 use crate::composer::composer_t;
-use crate::input::{Action, Focus, Modal};
-use crate::layout::DockWidth;
+use crate::input::{Focus, Modal};
+use crate::selection::{ClickKind, RowId};
 use crate::sidebar::{MoveMark, OverlayKind, SidebarItemKind, overlay_t, sidebar_item_t};
 
-/// What a move carries: a conversation or a folder, with the title it shows while moving.
+/// What a move carries: a conversation, a folder or a selection of several (D60), with the
+/// title it shows while moving.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MoveSource {
-    Session { id: String, title: String },
-    Folder { id: String, name: String },
+    Session {
+        id: String,
+        title: String,
+    },
+    Folder {
+        id: String,
+        name: String,
+    },
+    /// Several rows, moved as one batch. Each one is checked, and one refusal refuses all.
+    Many {
+        items: Vec<MoveSource>,
+        title: String,
+    },
 }
 
 impl MoveSource {
@@ -28,6 +40,7 @@ impl MoveSource {
         match self {
             MoveSource::Session { title, .. } => title,
             MoveSource::Folder { name, .. } => name,
+            MoveSource::Many { title, .. } => title,
         }
     }
 
@@ -37,7 +50,16 @@ impl MoveSource {
             (MoveSource::Folder { id, .. }, SidebarItemKind::Folder { id: other, .. }) => {
                 id == other
             }
+            (MoveSource::Many { items, .. }, _) => items.iter().any(|m| m.is_item(kind)),
             _ => false,
+        }
+    }
+
+    /// The single rows this source moves.
+    fn parts(&self) -> Vec<&MoveSource> {
+        match self {
+            MoveSource::Many { items, .. } => items.iter().collect(),
+            other => vec![other],
         }
     }
 }
@@ -49,6 +71,10 @@ pub enum PromptKind {
         parent: Option<String>,
     },
     Rename {
+        id: String,
+    },
+    /// A conversation's title (D57). An empty title clears it.
+    RenameSession {
         id: String,
     },
 }
@@ -72,6 +98,8 @@ pub struct grab_t {
     /// The row under the pointer at the last drag event, read from the hit registry of the
     /// frame the user saw.
     pub over: Option<usize>,
+    /// What a release on the same row does: open it, or change the selection (D60).
+    pub click: ClickKind,
 }
 
 /// A few words for a refused destination, short enough for a sidebar row. The toast carries
@@ -127,7 +155,7 @@ impl app_t {
     /// Bring the sidebar into view with the keys on it: docked when wide, the drawer when
     /// narrow.
     fn show_sidebar(&mut self) {
-        if self.size.0 >= DockWidth {
+        if self.can_dock() {
             self.sidebar_pinned = true;
         } else {
             self.drawer_open = true;
@@ -262,10 +290,18 @@ impl app_t {
         }
     }
 
+    /// `r`: rename the cursor row, a folder or a conversation.
     pub fn start_rename(&mut self) {
+        if let Some(RowId::Session(id)) = self.row_id(self.sidebar_sel) {
+            self.start_rename_session(&id);
+            return;
+        }
         self.cancel_sidebar_modal();
         let Some(id) = self.selected_folder() else {
-            self.say("select a folder to rename it", ToastKind::Info);
+            self.say(
+                "select a folder or a conversation to rename it",
+                ToastKind::Info,
+            );
             return;
         };
         let mut editor = composer_t::new();
@@ -276,6 +312,23 @@ impl app_t {
         });
         self.show_sidebar();
         self.rebuild_sidebar_items();
+    }
+
+    /// The title prompt of a conversation, filled with the title it shows now (D57).
+    pub fn start_rename_session(&mut self, id: &str) {
+        self.cancel_sidebar_modal();
+        self.menu = None;
+        let mut editor = composer_t::new();
+        editor.set_text(&self.conversation_title(id));
+        self.prompt = Some(prompt_t {
+            kind: PromptKind::RenameSession { id: id.to_string() },
+            editor,
+        });
+        self.show_sidebar();
+        self.rebuild_sidebar_items();
+        if let Some(i) = self.row_index(&RowId::Session(id.to_string())) {
+            self.sidebar_sel = i;
+        }
     }
 
     pub fn start_delete(&mut self) {
@@ -301,6 +354,12 @@ impl app_t {
         match prompt.kind {
             PromptKind::Create { parent } => {
                 if self.create_folder_named(name, parent) {
+                    self.prompt = None;
+                    self.rebuild_sidebar_items();
+                }
+            }
+            PromptKind::RenameSession { id } => {
+                if self.rename_conversation(&id, name) {
                     self.prompt = None;
                     self.rebuild_sidebar_items();
                 }
@@ -457,6 +516,10 @@ impl app_t {
 
     fn check_move(&self, source: &MoveSource, dest: Option<&str>) -> Result<(), OrganizeError> {
         match source {
+            MoveSource::Many { items, .. } => items
+                .iter()
+                .filter(|m| !self.rides_along(m, source))
+                .try_for_each(|m| self.check_move(m, dest)),
             MoveSource::Session { .. } => match dest {
                 Some(f) if self.organization.folder(f).is_none() => {
                     Err(OrganizeError::FolderNotFound { id: f.to_string() })
@@ -467,8 +530,32 @@ impl app_t {
         }
     }
 
+    /// True when `part` of a selection lies inside a folder that the same selection moves, so
+    /// it travels with that folder and is not moved on its own.
+    fn rides_along(&self, part: &MoveSource, all: &MoveSource) -> bool {
+        let inside = |f: &str| {
+            all.parts().iter().any(|m| match m {
+                MoveSource::Folder { id, .. } => self.organization.is_within(f, id),
+                _ => false,
+            })
+        };
+        match part {
+            MoveSource::Session { id, .. } => self.organization.folder_of(id).is_some_and(inside),
+            MoveSource::Folder { id, .. } => self
+                .organization
+                .folder(id)
+                .and_then(|f| f.parent.as_deref())
+                .is_some_and(inside),
+            MoveSource::Many { .. } => false,
+        }
+    }
+
     fn already_there(&self, source: &MoveSource, dest: Option<&str>) -> bool {
         match source {
+            MoveSource::Many { items, .. } => items
+                .iter()
+                .filter(|m| !self.rides_along(m, source))
+                .all(|m| self.already_there(m, dest)),
             MoveSource::Session { id, .. } => self.organization.folder_of(id) == dest,
             MoveSource::Folder { id, .. } => self
                 .organization
@@ -502,11 +589,39 @@ impl app_t {
         self.destination_of(row).map(|_| row)
     }
 
-    /// `m`: pick the selected row up. `j` `k` then choose among the allowed destinations.
+    /// What moving these rows carries: one row, or the selection as one source.
+    pub fn source_of(&self, rows: &[RowId]) -> Option<MoveSource> {
+        let mut parts: Vec<MoveSource> = rows
+            .iter()
+            .filter_map(|r| self.row_index(r))
+            .filter_map(|i| self.source_at(i))
+            .collect();
+        match parts.len() {
+            0 => None,
+            1 => parts.pop(),
+            n => Some(MoveSource::Many {
+                items: parts,
+                title: format!("{n} items"),
+            }),
+        }
+    }
+
+    /// `m`: pick the selection, or the cursor row, up. `j` `k` then choose among the allowed
+    /// destinations.
     pub fn start_pickup(&mut self) {
+        let rows = self.targets();
+        self.start_pickup_of(rows);
+    }
+
+    /// Pick these rows up (`m`, the move chip, "Move to folder…" in the menu).
+    pub fn start_pickup_of(&mut self, rows: Vec<RowId>) {
         self.cancel_sidebar_modal();
-        let origin = self.sidebar_sel;
-        let Some(source) = self.source_at(origin) else {
+        self.menu = None;
+        let origin = rows
+            .first()
+            .and_then(|r| self.row_index(r))
+            .unwrap_or(self.sidebar_sel);
+        let Some(source) = self.source_of(&rows) else {
             self.say(
                 "select a conversation or a folder to move it",
                 ToastKind::Info,
@@ -588,14 +703,30 @@ impl app_t {
             );
             return true;
         }
-        let op = match &source {
-            MoveSource::Session { id, .. } => OrganizeOp::MoveSession {
+        let op_of = |m: &MoveSource| match m {
+            MoveSource::Session { id, .. } => Some(OrganizeOp::MoveSession {
                 session_id: id.clone(),
                 folder: dest.clone(),
-            },
-            MoveSource::Folder { id, .. } => OrganizeOp::MoveFolder {
+            }),
+            MoveSource::Folder { id, .. } => Some(OrganizeOp::MoveFolder {
                 id: id.clone(),
                 parent: dest.clone(),
+            }),
+            MoveSource::Many { .. } => None,
+        };
+        let op = match &source {
+            MoveSource::Many { items, .. } => OrganizeOp::Batch(
+                items
+                    .iter()
+                    .filter(|m| {
+                        !self.rides_along(m, &source) && !self.already_there(m, dest.as_deref())
+                    })
+                    .filter_map(op_of)
+                    .collect(),
+            ),
+            single => match op_of(single) {
+                Some(op) => op,
+                None => return true,
             },
         };
         match self.organize(op) {
@@ -622,21 +753,29 @@ impl app_t {
 
     // Dragging.
 
-    /// A press on a sidebar row.
-    pub fn grab_row(&mut self, index: usize) {
+    /// A press on a sidebar row. Pressing a row of a selection of several grabs the whole
+    /// selection, so a drag moves all of it (D60).
+    pub fn grab_row(&mut self, index: usize, click: ClickKind) {
         if self.prompt.is_some() || self.confirm.is_some() {
             self.cancel_sidebar_modal();
         }
         let source = if self.pickup.is_some() {
             None
         } else {
-            self.source_at(index)
+            match self.row_id(index) {
+                Some(id) if self.selection.len() > 1 && self.selection.contains(&id) => {
+                    let rows = self.selection.in_order(&self.visible_rows());
+                    self.source_of(&rows)
+                }
+                _ => self.source_at(index),
+            }
         };
         self.grab = Some(grab_t {
             index,
             source,
             moved: false,
             over: Some(index),
+            click,
         });
     }
 
@@ -685,7 +824,8 @@ impl app_t {
         }
         if !grab.moved {
             if row == Some(grab.index) {
-                self.apply(Action::SidebarActivateAt(grab.index));
+                self.click_row(grab.index, grab.click);
+                self.rebuild_sidebar_items();
             }
             return;
         }
@@ -734,6 +874,15 @@ impl app_t {
                     let anchor = self.folder_index(id);
                     (
                         "rename folder".to_string(),
+                        anchor,
+                        anchor.is_some(),
+                        depth_of(anchor).unwrap_or(0),
+                    )
+                }
+                PromptKind::RenameSession { id } => {
+                    let anchor = self.row_index(&RowId::Session(id.clone()));
+                    (
+                        "rename conversation · empty clears".to_string(),
                         anchor,
                         anchor.is_some(),
                         depth_of(anchor).unwrap_or(0),

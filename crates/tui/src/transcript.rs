@@ -62,6 +62,11 @@ pub struct render_ctx_t<'a> {
     pub info: &'a runtime_info_t,
     /// App-clock time the title card's logo reveal started (D56), while it plays.
     pub logo_start: Option<u64>,
+    /// Tool blocks start expanded (the `tool_results` setting, D63). A block's own toggle
+    /// flips its state from this default.
+    pub tools_open: bool,
+    /// Blank rows after each block: `BlockGap`, or 0 with the compact density (D63).
+    pub gap: usize,
 }
 
 /// Seed of the logo reveal's textures, so every launch draws the same frames.
@@ -643,6 +648,8 @@ fn args_summary(tool: &tool_view_t) -> String {
 fn tool_rows(block: &block_t, tool: &tool_view_t, ctx: &render_ctx_t<'_>) -> block_rows_t {
     let theme = ctx.theme;
     let w = ctx.width.max(1);
+    // The block's toggle flips it from the default of the `tool_results` setting.
+    let expanded = block.expanded != ctx.tools_open;
     let rail = Some((RailThin, theme.tool));
     let target = Some(Action::ToggleBlock(block.id));
     let spinner = ["◐", "◓", "◑", "◒"];
@@ -699,12 +706,12 @@ fn tool_rows(block: &block_t, tool: &tool_view_t, ctx: &render_ctx_t<'_>) -> blo
             lines.push(l);
         }
         // While pending, the docked approval widget shows the summary; here it shows on expand.
-        let show_summary = block.expanded;
+        let show_summary = expanded;
         if show_summary {
             let inner = w.saturating_sub(2).max(1);
             let rows = hard_wrap(&sanitize(&req.summary, true), inner);
             let total = rows.len();
-            let limit = if block.expanded {
+            let limit = if expanded {
                 MaxExpandedRows
             } else {
                 MaxSummaryRows
@@ -754,7 +761,7 @@ fn tool_rows(block: &block_t, tool: &tool_view_t, ctx: &render_ctx_t<'_>) -> blo
             hard_wrap(&clean, inner)
         };
         let total = all.len();
-        let shown = if block.expanded {
+        let shown = if expanded {
             total.min(MaxExpandedRows)
         } else {
             1
@@ -770,13 +777,13 @@ fn tool_rows(block: &block_t, tool: &tool_view_t, ctx: &render_ctx_t<'_>) -> blo
         let hidden = total.saturating_sub(shown);
         let mut tail = Vec::new();
         if hidden > 0 {
-            let verb = if block.expanded {
+            let verb = if expanded {
                 "not shown"
             } else {
                 "· enter or click to expand"
             };
             tail.push(format!("+{hidden} line(s) {verb}"));
-        } else if block.expanded && total > 1 {
+        } else if expanded && total > 1 {
             tail.push("enter or click to fold".to_string());
         }
         if out.truncated {
@@ -884,6 +891,7 @@ struct cached_t {
     width: usize,
     revision: u64,
     animate: bool,
+    tools_open: bool,
     rows: block_rows_t,
 }
 
@@ -907,6 +915,7 @@ impl transcript_view_t {
             let reuse = matches!(self.cache.get(&block.id), Some(c) if c.width == ctx.width
                 && c.revision == block.revision
                 && c.animate == ctx.animate
+                && c.tools_open == ctx.tools_open
                 && !c.rows.live
                 && !matches!(block.kind, BlockKind::Banner));
             if !reuse {
@@ -918,6 +927,7 @@ impl transcript_view_t {
                         width: ctx.width,
                         revision: block.revision,
                         animate: ctx.animate,
+                        tools_open: ctx.tools_open,
                         rows,
                     },
                 );
@@ -928,7 +938,7 @@ impl transcript_view_t {
                 .map(|c| c.rows.rows.len())
                 .unwrap_or(0);
             self.starts.push(self.total);
-            self.total = self.total.saturating_add(height).saturating_add(BlockGap);
+            self.total = self.total.saturating_add(height).saturating_add(ctx.gap);
         }
     }
 

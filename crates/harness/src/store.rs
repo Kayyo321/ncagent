@@ -119,6 +119,10 @@ pub trait session_store_t: Send + Sync {
     fn load(&self, id: &str) -> Result<loaded_session_t, StoreError>;
 
     fn append(&self, id: &str, event: &stamped_event_t) -> Result<(), StoreError>;
+
+    /// Removes a session's stored log. `NotFound` when there is none. Only that session's log is
+    /// removed (D59).
+    fn delete(&self, id: &str) -> Result<(), StoreError>;
 }
 
 /// True for an id of 1 to 64 bytes, each an ASCII letter, a digit, `_` or `-`. A store that
@@ -189,6 +193,14 @@ impl session_store_t for memory_store_t {
             .or_default()
             .push(event.clone());
         Ok(())
+    }
+
+    fn delete(&self, id: &str) -> Result<(), StoreError> {
+        check_id(id)?;
+        match self.locked().remove(id) {
+            Some(_) => Ok(()),
+            None => Err(StoreError::NotFound { id: id.to_string() }),
+        }
     }
 }
 
@@ -319,6 +331,35 @@ mod tests {
         assert_eq!(summaries[0].id, "real");
         assert_eq!(summaries[0].updated_ms, 50);
         assert_eq!(summaries[0].title, "later");
+    }
+
+    #[test]
+    fn a_deleted_session_is_not_found_and_leaves_the_list() {
+        let store = memory_store_t::new();
+        ok(store.append("keep", &start("keep", 1)));
+        ok(store.append("gone", &start("gone", 2)));
+        ok(store.delete("gone"));
+        assert!(matches!(
+            store.load("gone"),
+            Err(StoreError::NotFound { .. })
+        ));
+        let ids: Vec<String> = ok(store.list()).into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["keep"]);
+        assert!(matches!(
+            store.delete("gone"),
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn delete_refuses_an_invalid_id() {
+        let store = memory_store_t::new();
+        ok(store.append("keep", &start("keep", 1)));
+        assert!(matches!(
+            store.delete("../keep"),
+            Err(StoreError::InvalidId { .. })
+        ));
+        assert_eq!(ok(store.load("keep")).events.len(), 1);
     }
 
     #[test]

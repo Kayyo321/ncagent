@@ -18,10 +18,12 @@ use harness::api::runtime_t;
 
 pub mod app;
 pub mod banner;
+pub mod builtin_themes;
 pub mod canvas;
 pub mod clipboard;
 pub mod commands;
 pub mod composer;
+pub mod conversation;
 pub mod draw;
 pub mod effect;
 pub mod event_loop;
@@ -30,11 +32,24 @@ pub mod help;
 pub mod input;
 pub mod layout;
 pub mod markdown;
+pub mod menu;
+pub mod menu_draw;
+pub mod selection;
+pub mod settings;
+pub mod settings_draw;
+pub mod settings_page;
+pub mod settings_spec;
 pub mod sidebar;
+pub mod sidebar_tree;
 pub mod strip;
+pub mod tab_bar;
+pub mod tabs;
+pub mod tags;
 pub mod terminal;
 pub mod text;
 pub mod theme;
+pub mod theme_actions;
+pub mod theme_set;
 pub mod transcript;
 pub mod view_model;
 
@@ -45,6 +60,14 @@ pub mod scripted;
 mod app_tests;
 #[cfg(test)]
 mod folder_tests;
+#[cfg(test)]
+mod select_tests;
+#[cfg(test)]
+mod settings_tests;
+#[cfg(test)]
+mod tab_tests;
+#[cfg(test)]
+mod theme_tests;
 
 pub use theme::ColorMode;
 

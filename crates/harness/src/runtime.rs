@@ -18,7 +18,10 @@ use crate::organize::{
     OrganizeOp, memory_organization_store_t, organization_store_t, organization_t,
 };
 use crate::replay::restore;
-use crate::store::{session_store_t, session_summary_t};
+use crate::settings::{
+    custom_theme_t, loaded_themes_t, memory_settings_store_t, settings_store_t, settings_t,
+};
+use crate::store::{StoreError, session_store_t, session_summary_t};
 use crate::tools::tool_runner_t;
 
 /// Attempts per call: one sample and two retries (D46).
@@ -101,6 +104,9 @@ pub struct controller_runtime_t {
     organization: Arc<dyn organization_store_t>,
     /// Held across a load, a change and a save, so two changes never interleave.
     organize_lock: Mutex<()>,
+    settings: Arc<dyn settings_store_t>,
+    /// Held across a theme save or removal and the listing after it.
+    settings_lock: Mutex<()>,
 }
 
 impl controller_runtime_t {
@@ -136,12 +142,20 @@ impl controller_runtime_t {
             info,
             organization: Arc::new(memory_organization_store_t::new()),
             organize_lock: Mutex::new(()),
+            settings: Arc::new(memory_settings_store_t::new()),
+            settings_lock: Mutex::new(()),
         })
     }
 
     /// Keeps the folders in `store` instead of in memory (D50).
     pub fn with_organization_store(mut self, store: Arc<dyn organization_store_t>) -> Self {
         self.organization = store;
+        self
+    }
+
+    /// Keeps the settings and custom themes in `store` instead of in memory (D63, D64).
+    pub fn with_settings_store(mut self, store: Arc<dyn settings_store_t>) -> Self {
+        self.settings = store;
         self
     }
 }
@@ -192,6 +206,61 @@ impl runtime_t for controller_runtime_t {
         self.organization.save(&organization)?;
         Ok(organization)
     }
+
+    /// The log goes first. A conversation with no saved log is still forgotten, because the
+    /// store reports that as not found. Any other store error stops the change, so the filing
+    /// stays with the log it names.
+    fn delete_session(&self, id: &str) -> Result<organization_t, SessionError> {
+        let _held = self
+            .organize_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match self.deps.store.delete(id) {
+            Ok(()) | Err(StoreError::NotFound { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+        let mut organization = self.organization.load()?;
+        organization.apply(&OrganizeOp::ForgetSession {
+            session_id: id.to_string(),
+        })?;
+        self.organization.save(&organization)?;
+        Ok(organization)
+    }
+
+    fn settings(&self) -> Result<settings_t, SessionError> {
+        Ok(self.settings.load()?)
+    }
+
+    fn set_settings(&self, settings: settings_t) -> Result<settings_t, SessionError> {
+        self.settings.save(&settings)?;
+        Ok(settings)
+    }
+
+    fn themes(&self) -> Result<loaded_themes_t, SessionError> {
+        Ok(self.settings.list_themes()?)
+    }
+
+    fn read_theme_file(&self, path: &str) -> Result<custom_theme_t, SessionError> {
+        Ok(self.settings.read_theme_file(Path::new(path))?)
+    }
+
+    fn save_theme(&self, theme: custom_theme_t) -> Result<loaded_themes_t, SessionError> {
+        let _held = self
+            .settings_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.settings.save_theme(&theme)?;
+        Ok(self.settings.list_themes()?)
+    }
+
+    fn remove_theme(&self, id: &str) -> Result<loaded_themes_t, SessionError> {
+        let _held = self
+            .settings_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.settings.remove_theme(id)?;
+        Ok(self.settings.list_themes()?)
+    }
 }
 
 #[cfg(test)]
@@ -202,15 +271,24 @@ mod tests {
 
     use ncm::backend::{BackendError, backend_t};
 
+    use std::collections::BTreeMap;
+
     use crate::api::{SessionError, runtime_t};
     use crate::approval::ApprovalMode;
     use crate::controller::test_support::*;
-    use crate::event::SessionEvent;
+    use crate::event::{SessionEvent, stamped_event_t};
     use crate::organize::{
-        OrganizeError, OrganizeOp, memory_organization_store_t, organization_store_t,
+        MetaChange, OrganizeError, OrganizeOp, memory_organization_store_t, organization_store_t,
         organization_t,
     };
-    use crate::store::{memory_store_t, session_store_t, valid_session_id};
+    use crate::settings::{
+        SettingsError, custom_theme_t, memory_settings_store_t, settings_store_t, settings_t,
+    };
+    use crate::store::{
+        StoreError, loaded_session_t, memory_store_t, session_store_t, session_summary_t,
+        valid_session_id,
+    };
+    use crate::tools::tool_runner_t;
 
     use super::{controller_runtime_t, system_clock};
 
@@ -519,6 +597,241 @@ mod tests {
             Err(SessionError::Organize(OrganizeError::WouldNest { .. }))
         ));
         assert_eq!(runtime.organization().expect("the folders load"), before);
+    }
+
+    /// A session store that keeps logs in memory but refuses every delete.
+    struct refusing_delete_store_t {
+        inner: memory_store_t,
+    }
+
+    impl session_store_t for refusing_delete_store_t {
+        fn list(&self) -> Result<Vec<session_summary_t>, StoreError> {
+            self.inner.list()
+        }
+
+        fn load(&self, id: &str) -> Result<loaded_session_t, StoreError> {
+            self.inner.load(id)
+        }
+
+        fn append(&self, id: &str, event: &stamped_event_t) -> Result<(), StoreError> {
+            self.inner.append(id, event)
+        }
+
+        fn delete(&self, id: &str) -> Result<(), StoreError> {
+            Err(StoreError::Io {
+                path: id.to_string(),
+                message: "simulated delete failure".to_string(),
+            })
+        }
+    }
+
+    /// A runtime over any session store, with one scripted reply for a session that is run.
+    fn runtime_over(store: Arc<dyn session_store_t>) -> controller_runtime_t {
+        let backend: Arc<dyn backend_t> =
+            Arc::new(fake_backend_t::new(vec![fake_plan_t::reply("Reply.")]));
+        let tools: Arc<dyn tool_runner_t> = Arc::new(fake_tools_t::new(false));
+        controller_runtime_t::new(backend, tools, store, test_config(ApprovalMode::Ask))
+            .expect("the test runtime is valid")
+    }
+
+    /// Runs one message in a new session, so the session has a saved log, and returns its id.
+    fn session_with_a_log(runtime: &controller_runtime_t) -> String {
+        let mut session = runtime.new_session().expect("a session");
+        session.submit("hello".to_string());
+        pump_idle(session.as_mut());
+        session.id().to_string()
+    }
+
+    #[test]
+    fn delete_session_removes_the_log_its_filing_and_its_settings() {
+        let store = Arc::new(memory_store_t::new());
+        let runtime = runtime_over(store.clone());
+        let id = session_with_a_log(&runtime);
+        let folder = runtime
+            .organize(OrganizeOp::CreateFolder {
+                name: "Work".to_string(),
+                parent: None,
+            })
+            .expect("the folder is created");
+        let folder_id = folder.children(None)[0].id.clone();
+        runtime
+            .organize(OrganizeOp::MoveSession {
+                session_id: id.clone(),
+                folder: Some(folder_id.clone()),
+            })
+            .expect("the session is filed");
+        runtime
+            .organize(OrganizeOp::SetSessionMeta {
+                session_id: id.clone(),
+                change: MetaChange::Pinned(true),
+            })
+            .expect("the session is pinned");
+
+        let after = runtime.delete_session(&id).expect("the session is deleted");
+        assert!(matches!(store.load(&id), Err(StoreError::NotFound { .. })));
+        assert_eq!(after.folder_of(&id), None);
+        assert!(after.meta(&id).is_default());
+        assert_eq!(after.children(None).len(), 1, "the folder stays");
+        assert_eq!(runtime.organization().expect("the folders load"), after);
+        let listed = runtime.list_sessions().expect("the sessions list");
+        assert!(!listed.iter().any(|summary| summary.id == id));
+    }
+
+    #[test]
+    fn deleting_an_unknown_session_succeeds_and_forgets_its_filing() {
+        let runtime = runtime_over(Arc::new(memory_store_t::new()));
+        runtime
+            .organize(OrganizeOp::CreateFolder {
+                name: "Work".to_string(),
+                parent: None,
+            })
+            .expect("the folder is created");
+        runtime
+            .organize(OrganizeOp::MoveSession {
+                session_id: "s_never_saved".to_string(),
+                folder: Some("f1".to_string()),
+            })
+            .expect("the session is filed");
+
+        let after = runtime
+            .delete_session("s_never_saved")
+            .expect("a session with no log is still deleted");
+        assert_eq!(after.folder_of("s_never_saved"), None);
+        assert!(matches!(
+            runtime.delete_session("../escape"),
+            Err(SessionError::Store(StoreError::InvalidId { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_failing_store_delete_returns_the_error_and_keeps_the_filing() {
+        let store = Arc::new(refusing_delete_store_t {
+            inner: memory_store_t::new(),
+        });
+        let runtime = runtime_over(store.clone());
+        runtime
+            .organize(OrganizeOp::CreateFolder {
+                name: "Work".to_string(),
+                parent: None,
+            })
+            .expect("the folder is created");
+        runtime
+            .organize(OrganizeOp::MoveSession {
+                session_id: "s_keep".to_string(),
+                folder: Some("f1".to_string()),
+            })
+            .expect("the session is filed");
+        let before = runtime.organization().expect("the folders load");
+
+        assert!(matches!(
+            runtime.delete_session("s_keep"),
+            Err(SessionError::Store(StoreError::Io { .. }))
+        ));
+        assert_eq!(runtime.organization().expect("the folders load"), before);
+        assert_eq!(
+            runtime
+                .organization()
+                .expect("the folders load")
+                .folder_of("s_keep"),
+            Some("f1")
+        );
+    }
+
+    /// A runtime whose settings and themes are kept in `store`.
+    fn runtime_keeping_settings_in(store: Arc<dyn settings_store_t>) -> controller_runtime_t {
+        runtime_with(
+            Arc::new(fake_backend_t::new(Vec::new())),
+            Arc::new(fake_tools_t::new(false)),
+            Arc::new(memory_store_t::new()),
+            test_config(ApprovalMode::Ask),
+        )
+        .with_settings_store(store)
+    }
+
+    fn sample_theme(id: &str) -> custom_theme_t {
+        custom_theme_t {
+            id: id.to_string(),
+            name: format!("Theme {id}"),
+            extends: "ncagent-dark".to_string(),
+            colors: BTreeMap::from([("accent".to_string(), "#abcdef".to_string())]),
+        }
+    }
+
+    #[test]
+    fn settings_are_the_defaults_until_saved_and_then_come_back() {
+        let store = Arc::new(memory_settings_store_t::new());
+        let first = runtime_keeping_settings_in(store.clone());
+        assert_eq!(
+            first.settings().expect("the settings load"),
+            settings_t::default()
+        );
+
+        let changed = settings_t {
+            animation: false,
+            open_tabs: vec!["s_1".to_string()],
+            active_tab: Some("s_1".to_string()),
+            ..settings_t::default()
+        };
+        assert_eq!(
+            first
+                .set_settings(changed.clone())
+                .expect("the settings save"),
+            changed
+        );
+
+        let second = runtime_keeping_settings_in(store);
+        assert_eq!(second.settings().expect("the settings load"), changed);
+    }
+
+    #[test]
+    fn an_invalid_setting_is_refused_and_nothing_is_saved() {
+        let runtime = runtime_keeping_settings_in(Arc::new(memory_settings_store_t::new()));
+        let bad = settings_t {
+            default_approval: ApprovalMode::Full,
+            ..settings_t::default()
+        };
+        assert!(matches!(
+            runtime.set_settings(bad),
+            Err(SessionError::Settings(SettingsError::Invalid { .. }))
+        ));
+        assert_eq!(
+            runtime.settings().expect("the settings load"),
+            settings_t::default()
+        );
+    }
+
+    #[test]
+    fn themes_are_saved_listed_and_removed() {
+        let runtime = runtime_keeping_settings_in(Arc::new(memory_settings_store_t::new()));
+        let listed = runtime
+            .save_theme(sample_theme("night"))
+            .expect("the theme saves");
+        assert_eq!(listed.themes.len(), 1);
+        assert_eq!(listed.themes[0].id, "night");
+        assert_eq!(runtime.themes().expect("the themes list"), listed);
+
+        let after = runtime.remove_theme("night").expect("the theme is removed");
+        assert!(after.themes.is_empty());
+        assert!(matches!(
+            runtime.remove_theme("night"),
+            Err(SessionError::Settings(SettingsError::NotFound { .. }))
+        ));
+    }
+
+    #[test]
+    fn a_bad_theme_is_refused_and_the_memory_store_reads_no_file() {
+        let runtime = runtime_keeping_settings_in(Arc::new(memory_settings_store_t::new()));
+        let mut bad = sample_theme("ok");
+        bad.id = "Bad Id".to_string();
+        assert!(matches!(
+            runtime.save_theme(bad),
+            Err(SessionError::Settings(SettingsError::Invalid { .. }))
+        ));
+        assert!(runtime.themes().expect("the themes list").themes.is_empty());
+        assert!(matches!(
+            runtime.read_theme_file("/nowhere/theme.json"),
+            Err(SessionError::Settings(SettingsError::Invalid { .. }))
+        ));
     }
 
     #[test]

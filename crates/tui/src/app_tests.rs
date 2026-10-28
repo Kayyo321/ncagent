@@ -24,8 +24,10 @@ use crate::app::{EscapeDelayMs, app_options_t, app_t};
 use crate::canvas::buffer_lines;
 use crate::draw::draw;
 use crate::folder_tests::{file_saved_in_research, folder_index, seed_research};
-use crate::input::{Action, Focus, Modal, Target};
+use crate::input::{Action, Focus, MenuAction, Modal, SelectAction, TabAction, Target};
 use crate::scripted::{ScriptCall, preview_info, script_handle_t, scripted_runtime_t};
+use crate::settings_page::PageAction;
+use crate::settings_spec::Section;
 use crate::theme::ColorMode;
 use crate::view_model::tests::{call_end, call_start, full_session, level_done, session_start};
 
@@ -77,8 +79,22 @@ impl rig_t {
         self.rt.handle(i).unwrap_or_else(|| panic!("no handle {i}"))
     }
 
+    /// The handle of the session shown in tab `tab`, found by its id.
+    pub(crate) fn tab_handle(&self, tab: usize) -> script_handle_t {
+        let id = self
+            .app
+            .sessions
+            .get(tab)
+            .map(|s| s.session.id().to_string())
+            .unwrap_or_default();
+        (0..256)
+            .filter_map(|i| self.rt.handle(i))
+            .find(|h| h.id == id)
+            .unwrap_or_else(|| panic!("no handle for tab {tab} ({id})"))
+    }
+
     pub(crate) fn push(&mut self, events: Vec<SessionEvent>) {
-        self.handle(self.app.active).push(events);
+        self.tab_handle(self.app.active).push(events);
         self.frame();
     }
 
@@ -140,6 +156,34 @@ impl rig_t {
         self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
     }
 
+    pub(crate) fn mouse_mods(&mut self, kind: MouseEventKind, x: u16, y: u16, mods: KeyModifiers) {
+        self.app.handle_event(&Event::Mouse(MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: mods,
+        }));
+        self.frame();
+    }
+
+    /// Press and release `button` at a cell with modifiers.
+    pub(crate) fn click_with(&mut self, button: MouseButton, x: u16, y: u16, mods: KeyModifiers) {
+        self.mouse_mods(MouseEventKind::Down(button), x, y, mods);
+        self.mouse_mods(MouseEventKind::Up(button), x, y, mods);
+    }
+
+    /// A click on sidebar row `index` with modifiers.
+    pub(crate) fn click_row_with(&mut self, index: usize, mods: KeyModifiers) {
+        let r = self.row_rect(index);
+        self.click_with(MouseButton::Left, r.x + 3, r.y, mods);
+    }
+
+    /// A right click on sidebar row `index`.
+    pub(crate) fn right_click_row(&mut self, index: usize) {
+        let r = self.row_rect(index);
+        self.click_with(MouseButton::Right, r.x + 3, r.y, KeyModifiers::NONE);
+    }
+
     pub(crate) fn rect_of(&self, action: &Action) -> Rect {
         self.app
             .hits
@@ -153,7 +197,7 @@ impl rig_t {
     }
 
     pub(crate) fn calls(&self) -> Vec<ScriptCall> {
-        self.handle(self.app.active).calls()
+        self.tab_handle(self.app.active).calls()
     }
 
     /// The rectangle of sidebar row `index` in the last frame.
@@ -561,7 +605,7 @@ fn keyboard_parity_table() {
     let cases: Vec<case_t> = vec![
         case_t {
             name: "new chat button / ctrl+n",
-            setup: noop,
+            setup: |r| r.push(start_turn("used")),
             mouse: |r| r.click_action(&Action::NewChat),
             keys: |r| r.key(KeyCode::Char('n'), KeyModifiers::CONTROL),
             observe: |r| format!("{} {}", r.app.sessions.len(), r.app.active),
@@ -881,6 +925,292 @@ fn keyboard_parity_table() {
             },
             observe: |r| format!("{:?}", r.app.folded),
         },
+        case_t {
+            name: "tab click / alt+1",
+            setup: |r| r.key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            mouse: |r| {
+                let t = r.app.hits.find_target(&Target::Tab(0)).unwrap_or_default();
+                r.click(t.x + 3, t.y);
+            },
+            keys: |r| r.key(KeyCode::Char('1'), KeyModifiers::ALT),
+            observe: |r| format!("{}", r.app.active),
+        },
+        case_t {
+            name: "tab × chip / alt+w",
+            setup: |r| r.key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            mouse: |r| r.click_action(&Action::Tab(TabAction::Close(1))),
+            keys: |r| r.key(KeyCode::Char('w'), KeyModifiers::ALT),
+            observe: |r| format!("{} {}", r.app.sessions.len(), r.app.active),
+        },
+        case_t {
+            name: "tab middle click / alt+w",
+            setup: |r| r.key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            mouse: |r| {
+                let t = r.app.hits.find_target(&Target::Tab(1)).unwrap_or_default();
+                r.click_with(MouseButton::Middle, t.x + 3, t.y, KeyModifiers::NONE);
+            },
+            keys: |r| r.key(KeyCode::Char('w'), KeyModifiers::ALT),
+            observe: |r| format!("{} {}", r.app.sessions.len(), r.app.active),
+        },
+        case_t {
+            name: "tab + chip / ctrl+t",
+            setup: noop,
+            mouse: |r| r.click_action(&Action::Tab(TabAction::New)),
+            keys: |r| r.key(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            observe: |r| format!("{} {}", r.app.sessions.len(), r.app.active),
+        },
+        case_t {
+            name: "tab right click / shift+f10",
+            setup: noop,
+            mouse: |r| {
+                let t = r.app.hits.find_target(&Target::Tab(0)).unwrap_or_default();
+                r.click_with(MouseButton::Right, t.x + 3, t.y, KeyModifiers::NONE);
+            },
+            keys: |r| r.key(KeyCode::F(10), KeyModifiers::SHIFT),
+            observe: menu_view,
+        },
+        case_t {
+            name: "row right click / . in the sidebar",
+            setup: noop,
+            mouse: |r| {
+                let i = saved_index(r);
+                r.right_click_row(i);
+            },
+            keys: |r| {
+                let i = saved_index(r);
+                r.select_by_keys(i);
+                r.ch('.');
+            },
+            observe: menu_view,
+        },
+        case_t {
+            name: "menu item click / menu keys",
+            setup: |r| {
+                let i = saved_index(r);
+                r.select_by_keys(i);
+                r.ch('.');
+            },
+            mouse: |r| r.click_action(&Action::Menu(MenuAction::Pick(3))),
+            keys: |r| {
+                for _ in 0..3 {
+                    r.ch('j');
+                }
+                r.key(KeyCode::Enter, KeyModifiers::NONE);
+            },
+            observe: |r| format!("{:?}", r.app.organization.meta("saved-1")),
+        },
+        case_t {
+            name: "check chip / ctrl+space",
+            setup: noop,
+            mouse: |r| {
+                let i = saved_index(r);
+                r.hover_row(i);
+                r.click_action(&Action::Select(SelectAction::ToggleAt(i)));
+            },
+            keys: |r| {
+                let i = saved_index(r);
+                r.select_by_keys(i);
+                r.key(KeyCode::Char(' '), KeyModifiers::CONTROL);
+            },
+            observe: |r| format!("{:?} {}", r.app.selection, r.app.sidebar_sel),
+        },
+        case_t {
+            name: "ctrl+click / ctrl+space",
+            setup: noop,
+            mouse: |r| {
+                let i = saved_index(r);
+                r.click_row_with(i, KeyModifiers::CONTROL);
+            },
+            keys: |r| {
+                let i = saved_index(r);
+                r.select_by_keys(i);
+                r.key(KeyCode::Char(' '), KeyModifiers::CONTROL);
+            },
+            observe: |r| format!("{:?} {}", r.app.selection, r.app.sidebar_sel),
+        },
+        case_t {
+            name: "shift+click / shift+arrow",
+            setup: noop,
+            mouse: |r| {
+                let (a, b) = (saved_index(r), other_index(r));
+                r.click_row_with(a, KeyModifiers::CONTROL);
+                r.click_row_with(b, KeyModifiers::SHIFT);
+            },
+            keys: |r| {
+                let (a, b) = (saved_index(r), other_index(r));
+                r.select_by_keys(a);
+                r.key(KeyCode::Char(' '), KeyModifiers::CONTROL);
+                let dir = if b > a { KeyCode::Down } else { KeyCode::Up };
+                r.key(dir, KeyModifiers::SHIFT);
+            },
+            observe: |r| format!("{:?} {}", r.app.selection, r.app.sidebar_sel),
+        },
+        case_t {
+            name: "selection clear chip / esc",
+            setup: select_two,
+            mouse: |r| r.click_action(&Action::Select(SelectAction::Clear)),
+            keys: |r| {
+                r.key(KeyCode::Esc, KeyModifiers::NONE);
+                r.advance(EscapeDelayMs);
+            },
+            observe: |r| format!("{:?}", r.app.selection),
+        },
+        case_t {
+            name: "selection menu chip / shift+f10",
+            setup: select_two,
+            mouse: |r| r.click_action(&Action::Menu(MenuAction::OpenSelection)),
+            keys: |r| r.key(KeyCode::F(10), KeyModifiers::SHIFT),
+            observe: menu_view,
+        },
+        case_t {
+            name: "delete dialog button / enter",
+            setup: |r| {
+                let i = saved_index(r);
+                r.select_by_keys(i);
+                r.ch('d');
+            },
+            mouse: |r| r.click_action(&Action::ConfirmYes),
+            keys: |r| r.key(KeyCode::Enter, KeyModifiers::NONE),
+            observe: |r| format!("{:?} {:?}", r.rt.deleted(), r.app.delete_plan),
+        },
+        case_t {
+            name: "delete dialog cancel button / n",
+            setup: |r| {
+                let i = saved_index(r);
+                r.select_by_keys(i);
+                r.ch('d');
+            },
+            mouse: |r| r.click_action(&Action::SidebarCancel),
+            keys: |r| r.ch('n'),
+            observe: |r| format!("{:?} {:?}", r.rt.deleted(), r.app.delete_plan),
+        },
+        case_t {
+            name: "settings button / ctrl+o",
+            setup: noop,
+            mouse: |r| r.click_action(&Action::Page(PageAction::Open)),
+            keys: |r| r.key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            observe: |r| format!("{} {:?}", r.app.page_shown, r.app.focus),
+        },
+        case_t {
+            name: "settings section / digit",
+            setup: |r| r.key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            mouse: |r| r.click_action(&Action::Page(PageAction::Section(Section::Sidebar))),
+            keys: |r| r.ch('2'),
+            observe: |r| format!("{:?}", r.app.page.as_ref().map(|p| p.section)),
+        },
+        case_t {
+            name: "settings toggle chip / j enter",
+            setup: |r| r.key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            mouse: |r| r.click_action(&Action::Page(PageAction::Toggle(1))),
+            keys: |r| {
+                r.ch('j');
+                r.key(KeyCode::Enter, KeyModifiers::NONE);
+            },
+            observe: |r| format!("{} {}", r.app.settings.animation, r.app.animate),
+        },
+        case_t {
+            name: "settings choice chip / j j right",
+            setup: |r| r.key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            mouse: |r| r.click_action(&Action::Page(PageAction::Pick(2, 1))),
+            keys: |r| {
+                r.ch('j');
+                r.ch('j');
+                r.key(KeyCode::Right, KeyModifiers::NONE);
+            },
+            observe: |r| format!("{:?}", r.app.settings.density),
+        },
+        case_t {
+            name: "settings theme chip / right",
+            setup: |r| r.key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            mouse: |r| r.click_action(&Action::Page(PageAction::Pick(0, 1))),
+            keys: |r| r.key(KeyCode::Right, KeyModifiers::NONE),
+            observe: |r| format!("{} {:?}", r.app.settings.theme, r.app.theme.bg),
+        },
+        case_t {
+            name: "settings reset chip / r",
+            setup: |r| {
+                r.key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+                r.app.apply(Action::Page(PageAction::Pick(2, 1)));
+                r.app.apply(Action::Page(PageAction::Row(0)));
+                r.frame();
+            },
+            mouse: |r| r.click_action(&Action::Page(PageAction::Reset(2))),
+            keys: |r| {
+                r.ch('j');
+                r.ch('j');
+                r.ch('r');
+            },
+            observe: |r| format!("{:?}", r.app.settings.density),
+        },
+        case_t {
+            name: "settings theme row / enter",
+            setup: |r| {
+                r.key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+                r.ch('5');
+                r.key(KeyCode::Tab, KeyModifiers::NONE);
+            },
+            mouse: |r| r.click_action(&Action::Page(PageAction::ApplyTheme("navy".into()))),
+            keys: |r| {
+                r.ch('j');
+                r.ch('j');
+                r.key(KeyCode::Enter, KeyModifiers::NONE);
+                r.ch('k');
+                r.ch('k');
+            },
+            observe: |r| r.app.settings.theme.clone(),
+        },
+        case_t {
+            name: "settings import button / enter",
+            setup: |r| {
+                r.key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+                r.ch('5');
+                r.key(KeyCode::Tab, KeyModifiers::NONE);
+            },
+            mouse: |r| {
+                let at = crate::builtin_themes::BuiltinThemes.len();
+                r.click_action(&Action::Page(PageAction::Press(at)));
+            },
+            keys: |r| {
+                for _ in 0..crate::builtin_themes::BuiltinThemes.len() {
+                    r.ch('j');
+                }
+                r.key(KeyCode::Enter, KeyModifiers::NONE);
+            },
+            observe: |r| format!("{:?}", r.app.page.as_ref().map(|p| p.prompt.is_some())),
+        },
+        case_t {
+            name: "settings reset all button / enter",
+            setup: |r| {
+                r.key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+                r.app.apply(Action::Page(PageAction::Pick(2, 1)));
+                r.ch('6');
+                r.key(KeyCode::Tab, KeyModifiers::NONE);
+            },
+            mouse: |r| {
+                let at = r.app.page_rows().len() - 1;
+                r.click_action(&Action::Page(PageAction::Press(at)));
+            },
+            keys: |r| r.key(KeyCode::Enter, KeyModifiers::NONE),
+            observe: |r| format!("{:?}", r.app.page.as_ref().map(|p| p.confirm.clone())),
+        },
+        case_t {
+            name: "settings tab close / alt+w",
+            setup: |r| r.key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            mouse: |r| r.click_action(&Action::Page(PageAction::Close)),
+            keys: |r| r.key(KeyCode::Char('w'), KeyModifiers::ALT),
+            observe: |r| format!("{} {}", r.app.page.is_some(), r.app.sessions.len()),
+        },
+        case_t {
+            name: "settings tab / alt+.",
+            setup: |r| {
+                r.key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+                r.app.apply(Action::Tab(TabAction::Select(0)));
+                r.frame();
+            },
+            mouse: |r| r.click_action(&Action::Page(PageAction::Show)),
+            keys: |r| r.key(KeyCode::Char('.'), KeyModifiers::ALT),
+            observe: |r| format!("{} {:?}", r.app.page_shown, r.app.focus),
+        },
     ];
     for case in cases {
         let make = || {
@@ -914,6 +1244,35 @@ fn keyboard_parity_table() {
     }
 }
 
+/// What an open menu offers, without where it was drawn.
+fn menu_view(r: &rig_t) -> String {
+    match &r.app.menu {
+        Some(m) => format!(
+            "{:?} {} {:?}",
+            m.scope,
+            m.caption,
+            m.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>()
+        ),
+        None => "closed".to_string(),
+    }
+}
+
+/// Parity setup: the two conversations selected with ctrl+click, the sidebar focused.
+fn select_two(r: &mut rig_t) {
+    let (a, b) = (saved_index(r), other_index(r));
+    r.click_row_with(a, KeyModifiers::CONTROL);
+    r.click_row_with(b, KeyModifiers::CONTROL);
+}
+
+/// The sidebar row of the open New chat, next to the saved conversation.
+fn other_index(r: &rig_t) -> usize {
+    r.app
+        .sidebar_items
+        .iter()
+        .position(|i| matches!(&i.kind, crate::sidebar::SidebarItemKind::Session { id } if id != "saved-1"))
+        .unwrap_or_else(|| panic!("no other conversation: {:?}", r.app.sidebar_items))
+}
+
 fn tool_block_id(r: &rig_t) -> u64 {
     r.app
         .active()
@@ -944,43 +1303,58 @@ fn every_click_target_has_a_keyboard_path() {
     rig.push(approval_events().into_iter().skip(1).collect());
     rig.ch('/');
     for hit in &rig.app.hits.hits {
-        let ok = match &hit.target {
-            // Sidebar rows: j k and enter, or m to move (the folder tests cover each).
-            Target::Scrollbar | Target::Row(_) => true,
-            Target::Action(a) => matches!(
-                a,
-                Action::NewChat
-                    | Action::ToggleSidebar
-                    | Action::ToggleHelp
-                    | Action::Approve(_)
-                    | Action::PickOption(_)
-                    | Action::Cancel
-                    | Action::ToggleBlock(_)
-                    | Action::SelectBlockId(_)
-                    | Action::JumpLatest
-                    | Action::RunCommand(_)
-                    | Action::ClearQueue
-                    | Action::SetFocus(_)
-                    | Action::SidebarActivateAt(_)
-                    | Action::FocusNext
-                    | Action::Submit
-                    | Action::QuestionSubmit
-                    | Action::ToggleSelected
-                    | Action::SidebarActivate
-                    | Action::NewFolder
-                    | Action::NewSubfolder
-                    | Action::NewSubfolderAt(_)
-                    | Action::RenameFolderAt(_)
-                    | Action::DeleteFolderAt(_)
-                    | Action::PickUp
-                    | Action::PickUpAt(_)
-                    | Action::MoveDrop
-                    | Action::PromptSubmit
-                    | Action::ConfirmYes
-                    | Action::SidebarCancel
-            ),
-        };
-        assert!(ok, "click target without a keyboard path: {:?}", hit.target);
+        assert!(
+            keyboard_path(&hit.target),
+            "click target without a keyboard path: {:?}",
+            hit.target
+        );
+    }
+}
+
+/// True when what a click on `target` does also has a key. The parity tables check each pair;
+/// this list is what those tables cover.
+pub(crate) fn keyboard_path(target: &Target) -> bool {
+    match target {
+        // Sidebar rows: j k and enter, m to move, shift and ctrl keys to select. Tabs: alt+1
+        // to alt+9, alt+0, alt+. and alt+, (the tab tests cover each).
+        Target::Scrollbar | Target::Row(_) | Target::Tab(_) => true,
+        Target::Action(a) => matches!(
+            a,
+            Action::NewChat
+                | Action::ToggleSidebar
+                | Action::ToggleHelp
+                | Action::Approve(_)
+                | Action::PickOption(_)
+                | Action::Cancel
+                | Action::ToggleBlock(_)
+                | Action::SelectBlockId(_)
+                | Action::JumpLatest
+                | Action::RunCommand(_)
+                | Action::ClearQueue
+                | Action::SetFocus(_)
+                | Action::SidebarActivateAt(_)
+                | Action::FocusNext
+                | Action::Submit
+                | Action::QuestionSubmit
+                | Action::ToggleSelected
+                | Action::SidebarActivate
+                | Action::NewFolder
+                | Action::NewSubfolder
+                | Action::NewSubfolderAt(_)
+                | Action::RenameFolderAt(_)
+                | Action::DeleteFolderAt(_)
+                | Action::DeleteRows
+                | Action::PickUp
+                | Action::PickUpAt(_)
+                | Action::MoveDrop
+                | Action::PromptSubmit
+                | Action::ConfirmYes
+                | Action::SidebarCancel
+                | Action::Tab(_)
+                | Action::Select(_)
+                | Action::Menu(_)
+                | Action::Page(_)
+        ),
     }
 }
 
@@ -1226,7 +1600,7 @@ fn saved_session_opens_from_the_sidebar_settled() {
 #[test]
 fn background_sessions_keep_pumping() {
     let mut rig = rig_t::new(140, 40, true);
-    rig.key(KeyCode::Char('n'), KeyModifiers::CONTROL);
+    rig.key(KeyCode::Char('t'), KeyModifiers::CONTROL);
     assert_eq!(rig.app.active, 1);
     rig.handle(0).push(generating_events());
     rig.frame();
@@ -1436,7 +1810,8 @@ fn sticky_label_names_the_speaker_of_the_top_line() {
     rig.key(KeyCode::Home, KeyModifiers::CONTROL);
     rig.app.apply(Action::ScrollBy(start as i32 + 10));
     rig.frame();
-    let top = rig.screen().lines().next().unwrap_or("").to_string();
+    let first = usize::from(rig.app.layout.transcript.y);
+    let top = rig.screen().lines().nth(first).unwrap_or("").to_string();
     assert!(top.contains("you · turn 1"), "{top}");
     assert!(top.contains("continued"), "{top}");
 }
@@ -1496,7 +1871,8 @@ fn logo_reveal_is_skipped_without_animation_or_off_screen() {
     // Turning the effect off mid-reveal settles it at once.
     let mut rig = rig_t::new(140, 40, true);
     rig.advance(100);
-    rig.key(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    rig.typed("/animate");
+    rig.key(KeyCode::Enter, KeyModifiers::NONE);
     logo_row(&rig.screen());
     // A card scrolled out of view stops its reveal, so it never plays off screen.
     let mut rig = rig_t::new(140, 40, true);

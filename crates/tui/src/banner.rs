@@ -216,7 +216,7 @@ pub fn title_card(input: &card_input_t<'_>, width: usize, theme: &theme_t) -> Ve
         };
         for (row, text) in logo.iter().enumerate() {
             let t = row as f32 / (LogoRows - 1) as f32;
-            let color = mix(Color::Rgb(255, 255, 255), Color::Rgb(116, 176, 238), t);
+            let color = mix(theme.logo_hi, theme.logo_lo, t);
             let mut line = line_t::plain(
                 format!("{text:<width$}", width = LogoWidth),
                 Style::new().fg(color),

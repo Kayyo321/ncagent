@@ -98,11 +98,12 @@ enum Command {
         /// Session seed.
         #[arg(long, default_value_t = DefaultSeed)]
         seed: u64,
-        /// Directory for demo state: sessions in `sessions/`, folders in `folders.json`.
-        /// Defaults to the platform's local data directory.
+        /// Directory for demo state: sessions in `sessions/`, folders in `folders.json`,
+        /// settings in `settings.json` and custom themes in `themes/`. Defaults to the
+        /// platform's local data directory.
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Keep no demo state on disk. Sessions and folders are kept in memory only.
+        /// Keep no demo state on disk. Sessions, folders and settings are kept in memory only.
         #[arg(long)]
         ephemeral: bool,
         /// Do not capture the mouse.
@@ -236,9 +237,11 @@ fn run_demo(
     let runtime =
         controller_runtime_t::new(backend, tools, store, config).map_err(CliError::Session)?;
     let runtime = match state_dir {
-        Some(dir) => runtime.with_organization_store(Arc::new(
-            demo::organize::file_organization_store_t::new(dir),
-        )),
+        Some(dir) => runtime
+            .with_organization_store(Arc::new(demo::organize::file_organization_store_t::new(
+                dir.clone(),
+            )))
+            .with_settings_store(Arc::new(demo::settings::file_settings_store_t::new(dir))),
         None => runtime,
     };
     let options = tui_options_t {

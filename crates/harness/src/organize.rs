@@ -17,7 +17,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::valid_session_id;
+use crate::approval::ApprovalMode;
+use crate::store::{TitleLimit, valid_session_id};
 
 /// Folders nest to this many levels. A top-level folder is level 1 (D51).
 pub const MaxFolderDepth: usize = 5;
@@ -27,6 +28,9 @@ pub const FolderNameLimit: usize = 40;
 
 /// The version a file of folders carries.
 pub const OrganizationVersion: u32 = 1;
+
+/// Most operations one batch holds, counting the operations nested in it (D58).
+pub const MaxBatchOps: usize = 256;
 
 /// Longest numeric part of a folder id, so an id always fits a `u32`.
 const FolderIdDigits: usize = 9;
@@ -50,6 +54,98 @@ pub struct organization_file_t {
     pub folders: Vec<folder_t>,
     /// Session id to folder id. A session not listed here is unfiled.
     pub filed: BTreeMap<String, String>,
+    /// Session id to its settings (D57). A session not listed here has the defaults. Optional,
+    /// so a file written before D57 still loads.
+    #[serde(default)]
+    pub meta: BTreeMap<String, session_meta_t>,
+}
+
+/// A colour tag a conversation can carry (D57).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TagColor {
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Teal,
+    Blue,
+    Purple,
+    Pink,
+}
+
+impl TagColor {
+    /// Every colour, in the order a menu shows them.
+    pub fn all() -> [TagColor; 8] {
+        [
+            TagColor::Red,
+            TagColor::Orange,
+            TagColor::Yellow,
+            TagColor::Green,
+            TagColor::Teal,
+            TagColor::Blue,
+            TagColor::Purple,
+            TagColor::Pink,
+        ]
+    }
+
+    /// The lowercase name the file stores.
+    pub fn name(self) -> &'static str {
+        match self {
+            TagColor::Red => "red",
+            TagColor::Orange => "orange",
+            TagColor::Yellow => "yellow",
+            TagColor::Green => "green",
+            TagColor::Teal => "teal",
+            TagColor::Blue => "blue",
+            TagColor::Purple => "purple",
+            TagColor::Pink => "pink",
+        }
+    }
+
+    /// The colour with exactly this lowercase name.
+    pub fn from_name(name: &str) -> Option<TagColor> {
+        TagColor::all()
+            .into_iter()
+            .find(|color| color.name() == name)
+    }
+}
+
+/// What the user set on one conversation (D57). A conversation with only default values has no
+/// entry in the organisation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct session_meta_t {
+    /// A title that replaces the conversation's first message, trimmed (D57).
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub color: Option<TagColor>,
+    #[serde(default)]
+    pub archived: bool,
+    /// The approval mode of this conversation. `full` is never stored (D15, D57).
+    #[serde(default)]
+    pub approval: Option<ApprovalMode>,
+}
+
+impl session_meta_t {
+    /// True when every field has its default value.
+    pub fn is_default(&self) -> bool {
+        *self == session_meta_t::default()
+    }
+}
+
+/// One change to a conversation's settings (D57).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MetaChange {
+    /// `None`, or a title that is empty after trimming, clears the title.
+    Title(Option<String>),
+    Pinned(bool),
+    Color(Option<TagColor>),
+    Archived(bool),
+    /// `None` clears the mode, so the conversation uses the default for new conversations.
+    Approval(Option<ApprovalMode>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +180,18 @@ pub enum OrganizeError {
     UnsupportedVersion {
         version: u32,
     },
+    /// The title is longer than `TitleLimit` characters, or holds a control character (D57).
+    InvalidTitle {
+        reason: String,
+    },
+    /// A batch holds more than `limit` operations, counting nested ones (D58).
+    TooManyOps {
+        limit: usize,
+    },
+    /// The change is not allowed, such as `full` as a conversation's approval mode (D15, D57).
+    NotAllowed {
+        reason: String,
+    },
     Io {
         path: String,
         message: String,
@@ -111,6 +219,11 @@ impl fmt::Display for OrganizeError {
             OrganizeError::UnsupportedVersion { version } => {
                 write!(f, "folders file has unsupported version {version}")
             }
+            OrganizeError::InvalidTitle { reason } => write!(f, "invalid title: {reason}"),
+            OrganizeError::TooManyOps { limit } => {
+                write!(f, "a batch holds at most {limit} operations")
+            }
+            OrganizeError::NotAllowed { reason } => write!(f, "not allowed: {reason}"),
             OrganizeError::Io { path, message } => {
                 write!(f, "folders file i/o error at {path}: {message}")
             }
@@ -143,6 +256,17 @@ pub enum OrganizeOp {
         session_id: String,
         folder: Option<String>,
     },
+    /// Sets one of a conversation's settings (D57).
+    SetSessionMeta {
+        session_id: String,
+        change: MetaChange,
+    },
+    /// Removes a conversation's filing and settings. The caller deletes its log (D59).
+    ForgetSession {
+        session_id: String,
+    },
+    /// Applies the operations in order, or none of them (D58).
+    Batch(Vec<OrganizeOp>),
 }
 
 /// True for `f` followed by 1 to 9 ASCII digits.
@@ -177,8 +301,56 @@ pub fn validate_folder_name(name: &str) -> Result<String, OrganizeError> {
     Ok(trimmed.to_string())
 }
 
+/// The trimmed title, or `None` when it is empty after trimming, which clears the title. A title
+/// is refused when it is longer than `TitleLimit` characters or holds a control character (D57).
+pub fn validate_title(title: &str) -> Result<Option<String>, OrganizeError> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > TitleLimit {
+        return Err(OrganizeError::InvalidTitle {
+            reason: format!("the title is longer than {TitleLimit} characters"),
+        });
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(OrganizeError::InvalidTitle {
+            reason: "the title holds a control character".to_string(),
+        });
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+/// A stored title must already be in the form `validate_title` returns, so a file is never
+/// silently rewritten on load.
+fn checked_stored_title(title: &str) -> Result<String, OrganizeError> {
+    match validate_title(title)? {
+        Some(clean) if clean == title => Ok(clean),
+        _ => Err(OrganizeError::Malformed {
+            message: "a stored title is empty or not trimmed".to_string(),
+        }),
+    }
+}
+
 fn same_name(a: &str, b: &str) -> bool {
     a.to_lowercase() == b.to_lowercase()
+}
+
+/// True when `ops`, with every operation nested in a batch counted, holds no more operations than
+/// `budget`. Each operation takes one unit, so the recursion is never deeper than the budget.
+fn within_batch_budget(ops: &[OrganizeOp], budget: &mut usize) -> bool {
+    for op in ops {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if let OrganizeOp::Batch(inner) = op
+            && !within_batch_budget(inner, budget)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// The folders and which conversation is in which. The fields are private, so every value of
@@ -187,6 +359,7 @@ fn same_name(a: &str, b: &str) -> bool {
 pub struct organization_t {
     folders: Vec<folder_t>,
     filed: BTreeMap<String, String>,
+    meta: BTreeMap<String, session_meta_t>,
 }
 
 impl organization_t {
@@ -476,6 +649,75 @@ impl organization_t {
         Ok(())
     }
 
+    /// The settings of a conversation. The defaults when none were set.
+    pub fn meta(&self, session_id: &str) -> session_meta_t {
+        self.meta.get(session_id).cloned().unwrap_or_default()
+    }
+
+    /// Every conversation that has a setting other than the default, in id order.
+    pub fn metas(&self) -> impl Iterator<Item = (&str, &session_meta_t)> {
+        self.meta
+            .iter()
+            .map(|(session, meta)| (session.as_str(), meta))
+    }
+
+    /// Changes one setting of a conversation (D57). A setting that ends up at its default is
+    /// removed, so the file holds only what differs from the default.
+    pub fn set_meta(&mut self, session_id: &str, change: &MetaChange) -> Result<(), OrganizeError> {
+        if !valid_session_id(session_id) {
+            return Err(OrganizeError::InvalidId {
+                id: session_id.to_string(),
+            });
+        }
+        let mut meta = self.meta(session_id);
+        match change {
+            MetaChange::Title(title) => {
+                meta.title = match title {
+                    Some(title) => validate_title(title)?,
+                    None => None,
+                };
+            }
+            MetaChange::Pinned(pinned) => meta.pinned = *pinned,
+            MetaChange::Color(color) => meta.color = *color,
+            MetaChange::Archived(archived) => meta.archived = *archived,
+            MetaChange::Approval(Some(ApprovalMode::Full)) => {
+                return Err(OrganizeError::NotAllowed {
+                    reason: "approval mode full can be selected only on the command line"
+                        .to_string(),
+                });
+            }
+            MetaChange::Approval(mode) => meta.approval = *mode,
+        }
+        if meta.is_default() {
+            self.meta.remove(session_id);
+        } else {
+            self.meta.insert(session_id.to_string(), meta);
+        }
+        Ok(())
+    }
+
+    /// Removes a conversation's filing and its settings. The session log is not touched here
+    /// (D59).
+    pub fn forget_session(&mut self, session_id: &str) {
+        self.filed.remove(session_id);
+        self.meta.remove(session_id);
+    }
+
+    /// Applies the operations in order to a copy, and keeps the copy only when all of them
+    /// succeed (D58).
+    fn apply_batch(&mut self, ops: &[OrganizeOp]) -> Result<(), OrganizeError> {
+        let mut budget = MaxBatchOps;
+        if !within_batch_budget(ops, &mut budget) {
+            return Err(OrganizeError::TooManyOps { limit: MaxBatchOps });
+        }
+        let mut next = self.clone();
+        for op in ops {
+            next.apply(op)?;
+        }
+        *self = next;
+        Ok(())
+    }
+
     pub fn apply(&mut self, op: &OrganizeOp) -> Result<(), OrganizeError> {
         match op {
             OrganizeOp::CreateFolder { name, parent } => {
@@ -487,6 +729,17 @@ impl organization_t {
             OrganizeOp::MoveSession { session_id, folder } => {
                 self.move_session(session_id, folder.as_deref())
             }
+            OrganizeOp::SetSessionMeta { session_id, change } => self.set_meta(session_id, change),
+            OrganizeOp::ForgetSession { session_id } => {
+                if !valid_session_id(session_id) {
+                    return Err(OrganizeError::InvalidId {
+                        id: session_id.clone(),
+                    });
+                }
+                self.forget_session(session_id);
+                Ok(())
+            }
+            OrganizeOp::Batch(ops) => self.apply_batch(ops),
         }
     }
 
@@ -528,6 +781,7 @@ impl organization_t {
         let org = organization_t {
             folders,
             filed: BTreeMap::new(),
+            meta: BTreeMap::new(),
         };
         for folder in &org.folders {
             let mut seen = BTreeSet::new();
@@ -571,9 +825,37 @@ impl organization_t {
             }
             filed.insert(session.clone(), folder.clone());
         }
+        let mut meta = BTreeMap::new();
+        for (session, stored) in &file.meta {
+            if !valid_session_id(session) {
+                return Err(OrganizeError::InvalidId {
+                    id: session.clone(),
+                });
+            }
+            if stored.approval == Some(ApprovalMode::Full) {
+                return Err(OrganizeError::NotAllowed {
+                    reason: "approval mode full can be selected only on the command line"
+                        .to_string(),
+                });
+            }
+            let entry = session_meta_t {
+                title: match &stored.title {
+                    Some(title) => Some(checked_stored_title(title)?),
+                    None => None,
+                },
+                pinned: stored.pinned,
+                color: stored.color,
+                archived: stored.archived,
+                approval: stored.approval,
+            };
+            if !entry.is_default() {
+                meta.insert(session.clone(), entry);
+            }
+        }
         Ok(organization_t {
             folders: org.folders,
             filed,
+            meta,
         })
     }
 
@@ -584,6 +866,7 @@ impl organization_t {
             label: label.map(str::to_string),
             folders: self.folders.clone(),
             filed: self.filed.clone(),
+            meta: self.meta.clone(),
         }
     }
 }
@@ -817,5 +1100,301 @@ mod tests {
         let org = sample();
         ok(store.save(&org));
         assert_eq!(ok(store.load()), org);
+    }
+
+    fn meta_sample() -> organization_t {
+        let mut org = sample();
+        ok(org.set_meta("s_1", &MetaChange::Pinned(true)));
+        org
+    }
+
+    #[test]
+    fn tag_colors_have_fixed_lowercase_names() {
+        assert_eq!(TagColor::all().len(), 8);
+        for color in TagColor::all() {
+            assert_eq!(TagColor::from_name(color.name()), Some(color));
+        }
+        assert_eq!(TagColor::from_name("Red"), None);
+        assert_eq!(TagColor::from_name("magenta"), None);
+        assert_eq!(ok(serde_json::to_string(&TagColor::Teal)), "\"teal\"");
+    }
+
+    #[test]
+    fn session_settings_are_kept_and_a_default_setting_leaves_no_entry() {
+        let mut org = sample();
+        assert_eq!(org.meta("s_1"), session_meta_t::default());
+        ok(org.set_meta("s_1", &MetaChange::Pinned(true)));
+        ok(org.set_meta("s_1", &MetaChange::Color(Some(TagColor::Blue))));
+        ok(org.set_meta("s_1", &MetaChange::Archived(true)));
+        let meta = org.meta("s_1");
+        assert!(meta.pinned && meta.archived);
+        assert_eq!(meta.color, Some(TagColor::Blue));
+        assert_eq!(org.metas().count(), 1);
+
+        ok(org.set_meta("s_1", &MetaChange::Pinned(false)));
+        ok(org.set_meta("s_1", &MetaChange::Color(None)));
+        ok(org.set_meta("s_1", &MetaChange::Archived(false)));
+        assert!(org.meta("s_1").is_default());
+        assert_eq!(org.metas().count(), 0);
+    }
+
+    #[test]
+    fn titles_are_trimmed_cleared_when_empty_and_refused_when_bad() {
+        let mut org = sample();
+        ok(org.set_meta("s_1", &MetaChange::Title(Some("  Plan  ".to_string()))));
+        assert_eq!(org.meta("s_1").title.as_deref(), Some("Plan"));
+        ok(org.set_meta("s_1", &MetaChange::Title(Some("   ".to_string()))));
+        assert_eq!(org.meta("s_1").title, None);
+        assert_eq!(org.metas().count(), 0);
+
+        let before = org.clone();
+        assert!(matches!(
+            org.set_meta("s_1", &MetaChange::Title(Some("t".repeat(TitleLimit + 1)))),
+            Err(OrganizeError::InvalidTitle { .. })
+        ));
+        assert!(matches!(
+            org.set_meta("s_1", &MetaChange::Title(Some("a\u{7}b".to_string()))),
+            Err(OrganizeError::InvalidTitle { .. })
+        ));
+        assert_eq!(org, before, "a refused title changes nothing");
+
+        ok(org.set_meta("s_1", &MetaChange::Title(Some("t".repeat(TitleLimit)))));
+        assert_eq!(
+            org.meta("s_1").title.map(|title| title.chars().count()),
+            Some(TitleLimit)
+        );
+    }
+
+    #[test]
+    fn full_is_refused_and_the_other_approval_modes_are_kept() {
+        let mut org = sample();
+        assert!(matches!(
+            org.set_meta("s_1", &MetaChange::Approval(Some(ApprovalMode::Full))),
+            Err(OrganizeError::NotAllowed { .. })
+        ));
+        assert_eq!(org.metas().count(), 0);
+        ok(org.set_meta("s_1", &MetaChange::Approval(Some(ApprovalMode::Edit))));
+        assert_eq!(org.meta("s_1").approval, Some(ApprovalMode::Edit));
+        ok(org.set_meta("s_1", &MetaChange::Approval(None)));
+        assert!(org.meta("s_1").is_default());
+    }
+
+    #[test]
+    fn a_setting_needs_a_plain_session_id() {
+        let mut org = sample();
+        assert!(matches!(
+            org.set_meta("../x", &MetaChange::Pinned(true)),
+            Err(OrganizeError::InvalidId { .. })
+        ));
+        assert!(matches!(
+            org.apply(&OrganizeOp::ForgetSession {
+                session_id: "a/b".to_string()
+            }),
+            Err(OrganizeError::InvalidId { .. })
+        ));
+    }
+
+    #[test]
+    fn forgetting_a_session_removes_its_filing_and_settings_only() {
+        let mut org = meta_sample();
+        ok(org.apply(&OrganizeOp::ForgetSession {
+            session_id: "s_1".to_string(),
+        }));
+        assert_eq!(org.folder_of("s_1"), None);
+        assert!(org.meta("s_1").is_default());
+        assert_eq!(org.folder_of("s_2"), Some("f1"));
+        ok(org.apply(&OrganizeOp::ForgetSession {
+            session_id: "never-seen".to_string(),
+        }));
+    }
+
+    #[test]
+    fn a_batch_applies_every_operation_or_none() {
+        let mut org = sample();
+        let batch = OrganizeOp::Batch(vec![
+            OrganizeOp::CreateFolder {
+                name: "Batch".to_string(),
+                parent: None,
+            },
+            OrganizeOp::SetSessionMeta {
+                session_id: "s_1".to_string(),
+                change: MetaChange::Pinned(true),
+            },
+            OrganizeOp::MoveSession {
+                session_id: "s_1".to_string(),
+                folder: Some("f4".to_string()),
+            },
+        ]);
+        ok(org.apply(&batch));
+        assert_eq!(org.folder("f4").map(|f| f.name.as_str()), Some("Batch"));
+        assert_eq!(org.folder_of("s_1"), Some("f4"));
+        assert!(org.meta("s_1").pinned);
+
+        let before = org.clone();
+        let failing = OrganizeOp::Batch(vec![
+            OrganizeOp::CreateFolder {
+                name: "Never".to_string(),
+                parent: None,
+            },
+            OrganizeOp::MoveSession {
+                session_id: "s_2".to_string(),
+                folder: Some("f4".to_string()),
+            },
+            OrganizeOp::RenameFolder {
+                id: "f99".to_string(),
+                name: "Missing".to_string(),
+            },
+        ]);
+        assert!(matches!(
+            org.apply(&failing),
+            Err(OrganizeError::FolderNotFound { .. })
+        ));
+        assert_eq!(org, before, "a failing batch changes nothing");
+    }
+
+    #[test]
+    fn a_batch_may_nest_and_runs_in_order() {
+        let mut org = sample();
+        let nested = OrganizeOp::Batch(vec![
+            OrganizeOp::Batch(vec![OrganizeOp::CreateFolder {
+                name: "Inner".to_string(),
+                parent: None,
+            }]),
+            OrganizeOp::MoveSession {
+                session_id: "s_9".to_string(),
+                folder: Some("f4".to_string()),
+            },
+        ]);
+        ok(org.apply(&nested));
+        assert_eq!(org.folder_of("s_9"), Some("f4"));
+        assert_eq!(org.folder("f4").map(|f| f.name.as_str()), Some("Inner"));
+        ok(org.apply(&OrganizeOp::Batch(Vec::new())));
+    }
+
+    #[test]
+    fn a_batch_is_limited_to_max_batch_ops_counting_nested_ones() {
+        let forget = || OrganizeOp::ForgetSession {
+            session_id: "s_9".to_string(),
+        };
+        let mut org = organization_t::new();
+        let full: Vec<OrganizeOp> = (0..MaxBatchOps).map(|_| forget()).collect();
+        ok(org.apply(&OrganizeOp::Batch(full)));
+
+        let too_many: Vec<OrganizeOp> = (0..=MaxBatchOps).map(|_| forget()).collect();
+        assert_eq!(
+            org.apply(&OrganizeOp::Batch(too_many)),
+            Err(OrganizeError::TooManyOps { limit: MaxBatchOps })
+        );
+
+        // The nested batch takes one unit itself: 255 operations inside it make 256 in all.
+        let inside_limit = vec![OrganizeOp::Batch(
+            (0..MaxBatchOps - 1).map(|_| forget()).collect(),
+        )];
+        ok(org.apply(&OrganizeOp::Batch(inside_limit)));
+        let over_limit = vec![OrganizeOp::Batch(
+            (0..MaxBatchOps).map(|_| forget()).collect(),
+        )];
+        assert!(matches!(
+            org.apply(&OrganizeOp::Batch(over_limit)),
+            Err(OrganizeError::TooManyOps { .. })
+        ));
+    }
+
+    #[test]
+    fn settings_round_trip_through_the_file_and_defaults_are_not_stored() {
+        let mut org = sample();
+        ok(org.set_meta("s_1", &MetaChange::Title(Some("Plan".to_string()))));
+        ok(org.set_meta("s_2", &MetaChange::Approval(Some(ApprovalMode::Edit))));
+        let file = org.to_file(None);
+        assert_eq!(file.meta.len(), 2);
+        assert_eq!(ok(organization_t::from_file(&file)), org);
+        let text = ok(serde_json::to_string(&file));
+        assert!(text.contains("\"title\":\"Plan\""));
+
+        let mut stored = file;
+        stored
+            .meta
+            .insert("s_3".to_string(), session_meta_t::default());
+        let loaded = ok(organization_t::from_file(&stored));
+        assert_eq!(loaded.metas().count(), 2, "a default entry is dropped");
+    }
+
+    #[test]
+    fn a_file_without_settings_still_loads() {
+        let text = r#"{"version":1,"folders":[{"id":"f1","name":"A","parent":null}],
+            "filed":{"s_1":"f1"}}"#;
+        let file: organization_file_t = ok(serde_json::from_str(text));
+        assert!(file.meta.is_empty());
+        let org = ok(organization_t::from_file(&file));
+        assert_eq!(org.folder_of("s_1"), Some("f1"));
+        assert_eq!(org.metas().count(), 0);
+    }
+
+    #[test]
+    fn a_file_with_bad_settings_is_refused() {
+        let file = meta_sample().to_file(None);
+
+        let mut bad_id = file.clone();
+        bad_id.meta.insert(
+            "../x".to_string(),
+            session_meta_t {
+                pinned: true,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            organization_t::from_file(&bad_id),
+            Err(OrganizeError::InvalidId { .. })
+        ));
+
+        let mut full = file.clone();
+        full.meta.insert(
+            "s_2".to_string(),
+            session_meta_t {
+                approval: Some(ApprovalMode::Full),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            organization_t::from_file(&full),
+            Err(OrganizeError::NotAllowed { .. })
+        ));
+
+        let untrimmed = session_meta_t {
+            title: Some(" Plan".to_string()),
+            ..Default::default()
+        };
+        let mut untrimmed_file = file.clone();
+        untrimmed_file.meta.insert("s_2".to_string(), untrimmed);
+        assert!(matches!(
+            organization_t::from_file(&untrimmed_file),
+            Err(OrganizeError::Malformed { .. })
+        ));
+
+        let mut long = file.clone();
+        long.meta.insert(
+            "s_2".to_string(),
+            session_meta_t {
+                title: Some("t".repeat(TitleLimit + 1)),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            organization_t::from_file(&long),
+            Err(OrganizeError::InvalidTitle { .. })
+        ));
+
+        let mut empty = file;
+        empty.meta.insert(
+            "s_2".to_string(),
+            session_meta_t {
+                title: Some(String::new()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            organization_t::from_file(&empty),
+            Err(OrganizeError::Malformed { .. })
+        ));
     }
 }

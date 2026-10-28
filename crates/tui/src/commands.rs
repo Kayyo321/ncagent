@@ -12,7 +12,7 @@ pub struct command_t {
     pub about: &'static str,
 }
 
-pub const Commands: [command_t; 10] = [
+pub const Commands: [command_t; 18] = [
     command_t {
         name: "/help",
         args: "",
@@ -51,12 +51,52 @@ pub const Commands: [command_t; 10] = [
     command_t {
         name: "/animate",
         args: "",
-        about: "turn the generation effect on or off",
+        about: "turn animation on or off (saved in the settings)",
+    },
+    command_t {
+        name: "/settings",
+        args: "",
+        about: "open the settings page",
+    },
+    command_t {
+        name: "/theme",
+        args: "[name|import <path>]",
+        about: "list, apply or import a theme",
     },
     command_t {
         name: "/folder",
         args: "[name]",
         about: "new folder at the top level",
+    },
+    command_t {
+        name: "/tab",
+        args: "",
+        about: "a new chat in a new tab",
+    },
+    command_t {
+        name: "/close",
+        args: "",
+        about: "close this tab (a running turn stops first)",
+    },
+    command_t {
+        name: "/rename",
+        args: "[title]",
+        about: "rename this conversation; no title opens the prompt",
+    },
+    command_t {
+        name: "/pin",
+        args: "",
+        about: "pin or unpin this conversation",
+    },
+    command_t {
+        name: "/archive",
+        args: "",
+        about: "archive or unarchive this conversation",
+    },
+    command_t {
+        name: "/delete",
+        args: "",
+        about: "delete this conversation and its saved log",
     },
     command_t {
         name: "/quit",
@@ -75,8 +115,20 @@ pub enum Command {
     ClearQueue,
     Copy,
     Animate,
+    Settings,
+    /// `/theme`: no argument opens the theme list, else the theme to apply (an id or a name).
+    Theme(Option<String>),
+    /// `/theme import <path>`: the path as typed, spaces included.
+    ThemeImport(String),
     /// A new top-level folder: with a name it is created at once, without one the prompt opens.
     Folder(Option<String>),
+    Tab,
+    Close,
+    /// A title for the open conversation; without one the prompt opens.
+    Rename(Option<String>),
+    Pin,
+    Archive,
+    Delete,
     Quit,
 }
 
@@ -104,10 +156,30 @@ pub fn parse(text: &str) -> Option<Result<Command, String>> {
         "/clear-queue" => simple(Command::ClearQueue),
         "/copy" => simple(Command::Copy),
         "/animate" => simple(Command::Animate),
+        "/settings" => simple(Command::Settings),
+        "/theme" => {
+            let rest = text.get(name.len()..).unwrap_or("").trim();
+            match rest.split_once(char::is_whitespace) {
+                Some(("import", path)) => Ok(Command::ThemeImport(path.trim().to_string())),
+                None if rest == "import" => Err("usage: /theme import <path>".to_string()),
+                _ => Ok(Command::Theme((!rest.is_empty()).then(|| rest.to_string()))),
+            }
+        }
         "/quit" | "/exit" => simple(Command::Quit),
+        "/tab" => simple(Command::Tab),
+        "/close" => simple(Command::Close),
+        "/pin" => simple(Command::Pin),
+        "/archive" => simple(Command::Archive),
+        "/delete" => simple(Command::Delete),
         "/folder" => {
             let rest = text.get(name.len()..).unwrap_or("").trim();
             Ok(Command::Folder(
+                (!rest.is_empty()).then(|| rest.to_string()),
+            ))
+        }
+        "/rename" => {
+            let rest = text.get(name.len()..).unwrap_or("").trim();
+            Ok(Command::Rename(
                 (!rest.is_empty()).then(|| rest.to_string()),
             ))
         }
@@ -159,12 +231,35 @@ mod tests {
         assert_eq!(parse("/clear-queue"), Some(Ok(Command::ClearQueue)));
         assert_eq!(parse("/copy"), Some(Ok(Command::Copy)));
         assert_eq!(parse("/animate"), Some(Ok(Command::Animate)));
+        assert_eq!(parse("/settings"), Some(Ok(Command::Settings)));
+        assert_eq!(parse("/theme"), Some(Ok(Command::Theme(None))));
+        assert_eq!(
+            parse("/theme  Astral "),
+            Some(Ok(Command::Theme(Some("Astral".into()))))
+        );
+        assert_eq!(
+            parse("/theme import  ~/my themes/night.json "),
+            Some(Ok(Command::ThemeImport("~/my themes/night.json".into())))
+        );
+        assert!(matches!(parse("/theme import"), Some(Err(_))));
+        assert!(matches!(parse("/settings now"), Some(Err(_))));
         assert_eq!(parse("/quit"), Some(Ok(Command::Quit)));
         assert_eq!(parse("/folder"), Some(Ok(Command::Folder(None))));
         assert_eq!(
             parse("/folder  Research notes "),
             Some(Ok(Command::Folder(Some("Research notes".into()))))
         );
+        assert_eq!(parse("/tab"), Some(Ok(Command::Tab)));
+        assert_eq!(parse("/close"), Some(Ok(Command::Close)));
+        assert_eq!(parse("/pin"), Some(Ok(Command::Pin)));
+        assert_eq!(parse("/archive"), Some(Ok(Command::Archive)));
+        assert_eq!(parse("/delete"), Some(Ok(Command::Delete)));
+        assert_eq!(parse("/rename"), Some(Ok(Command::Rename(None))));
+        assert_eq!(
+            parse("/rename  The plan  "),
+            Some(Ok(Command::Rename(Some("The plan".into()))))
+        );
+        assert!(matches!(parse("/pin now"), Some(Err(_))));
     }
 
     #[test]
@@ -180,7 +275,7 @@ mod tests {
     #[test]
     fn completion_by_prefix() {
         let names: Vec<_> = completions("/c").iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["/cancel", "/clear-queue", "/copy"]);
+        assert_eq!(names, vec!["/cancel", "/clear-queue", "/copy", "/close"]);
         assert_eq!(completions("/").len(), Commands.len());
         assert!(completions("/help x").is_empty());
         assert!(completions("hi").is_empty());

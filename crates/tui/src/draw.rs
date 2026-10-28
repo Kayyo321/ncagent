@@ -5,6 +5,7 @@
 
 use harness::api::SessionPhase;
 use harness::approval::{ApprovalDecision, ApprovalMode};
+use harness::settings::{Density, ToolResultView};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -14,9 +15,14 @@ use crate::app::{ToastKind, app_t};
 use crate::banner::chip;
 use crate::canvas::{fill, put_line, put_str, put_str_right, tint};
 use crate::help::help_lines;
-use crate::input::{Action, Focus, Modal, Target};
+use crate::input::{Action, Focus, MenuAction, Modal, SelectAction, TabAction, Target};
 use crate::layout::{self, SidebarMode, layout_input_t};
-use crate::sidebar::{draw_sidebar, sidebar_input_t};
+use crate::menu_draw::{draw_delete_dialog, draw_menu};
+use crate::settings_draw::draw_settings_page;
+use crate::settings_page::{PageAction, PageKeys};
+use crate::sidebar::{draw_sidebar, sidebar_input_t, sidebar_sections_t};
+use crate::tab_bar::{draw_tab_bar, tab_bar_input_t, tab_view_t};
+use crate::tags::tag_rgb;
 use crate::text::{line_t, sanitize, span_t, str_width, truncate, wrap_spans};
 use crate::theme::{mix, quantize_buffer, theme_t};
 use crate::transcript::render_ctx_t;
@@ -238,6 +244,9 @@ fn question_widget(app: &app_t, width: usize) -> Option<widget_t> {
 pub fn draw(app: &mut app_t, frame: &mut Frame<'_>) {
     let area = frame.area();
     app.hits.clear();
+    app.overlay_areas.clear();
+    // The theme of this frame: the setting, or the settings page's preview (D64).
+    app.sync_theme();
     let theme = app.theme.clone();
     let buf = frame.buffer_mut();
     fill(buf, area, Style::new().bg(theme.bg).fg(theme.fg));
@@ -257,6 +266,8 @@ pub fn draw(app: &mut app_t, frame: &mut Frame<'_>) {
         queue_rows: u16::from(app.active().is_some_and(|s| !s.queued.is_empty())),
         popup_rows: popup.len().min(9) as u16,
         help_open: app.help_open,
+        visibility: app.settings.sidebar,
+        side_width: app.settings.sidebar_width,
     };
     let first = layout::compute(input);
     if first.too_small {
@@ -277,22 +288,41 @@ pub fn draw(app: &mut app_t, frame: &mut Frame<'_>) {
         _ => None,
     };
     let composer_rows = app.composer.layout(inner).0.len().clamp(1, MaxComposerRows);
-    let pad_top = u16::from(area.height >= 20);
+    let compact = app.settings.density == Density::Compact;
+    let pad_top = u16::from(area.height >= 20 && !compact);
     input.dock_rows = match &widget {
         Some(w) => (w.lines.len() as u16).saturating_add(pad_top * 2),
         None => (composer_rows as u16).saturating_add(1 + pad_top * 2),
     };
+    if app.page_shown {
+        // The page takes the main panel down to the status row: no composer, no queue.
+        input.dock_rows = 0;
+        input.queue_rows = 0;
+        input.popup_rows = 0;
+    }
     let lay = layout::compute(input);
     app.layout = lay;
 
-    draw_transcript(app, buf, lay.transcript, lay.scrollbar);
-    draw_queue(app, buf, lay.queue);
-    match &widget {
-        Some(w) => draw_widget(app, buf, lay.dock, w, pad_top),
-        None => draw_composer(app, buf, lay.dock, pad_top, composer_rows),
-    }
-    if !popup.is_empty() {
-        draw_popup(app, buf, lay.popup, &popup);
+    draw_tabs(app, buf, lay.tabs);
+    if app.page_shown {
+        let top = lay.tabs.bottom().max(lay.main.y);
+        let page = Rect::new(
+            lay.main.x,
+            top,
+            lay.main.width,
+            lay.status.y.saturating_sub(top),
+        );
+        draw_settings_page(app, buf, page);
+    } else {
+        draw_transcript(app, buf, lay.transcript, lay.scrollbar);
+        draw_queue(app, buf, lay.queue);
+        match &widget {
+            Some(w) => draw_widget(app, buf, lay.dock, w, pad_top),
+            None => draw_composer(app, buf, lay.dock, pad_top, composer_rows),
+        }
+        if !popup.is_empty() {
+            draw_popup(app, buf, lay.popup, &popup);
+        }
     }
     draw_status(app, buf, lay.status);
     if lay.sidebar_mode() != SidebarMode::Hidden {
@@ -307,7 +337,45 @@ pub fn draw(app: &mut app_t, frame: &mut Frame<'_>) {
     if app.help_open {
         draw_help(app, buf, lay.help);
     }
+    draw_delete_dialog(app, buf, lay.main);
+    draw_menu(app, buf, area);
     quantize_buffer(buf, app.options.color);
+}
+
+/// The tab bar: one tab per open conversation (D62).
+fn draw_tabs(app: &mut app_t, buf: &mut Buffer, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let theme = app.theme.clone();
+    let views: Vec<tab_view_t> = app
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, live)| {
+            let id = live.session.id();
+            let meta = app.organization.meta(id);
+            tab_view_t {
+                title: app.conversation_title(id),
+                color: meta.color.map(tag_rgb),
+                pinned: meta.pinned,
+                activity: live.activity(),
+                attention: live.attention,
+                active: i == app.active && !app.page_shown,
+            }
+        })
+        .collect();
+    let input = tab_bar_input_t {
+        tabs: &views,
+        scroll: app.tab_scroll,
+        follow: app.tab_shown != Some(app.active),
+        hover: app.hover,
+        clock: app.clock,
+        animate: app.animate,
+        page: app.page.as_ref().map(|_| app.page_shown),
+    };
+    app.tab_scroll = draw_tab_bar(buf, area, &input, &theme, &mut app.hits);
+    app.tab_shown = Some(app.active);
 }
 
 fn draw_too_small(buf: &mut Buffer, area: Rect, theme: &theme_t) {
@@ -348,6 +416,11 @@ fn draw_transcript(app: &mut app_t, buf: &mut Buffer, area: Rect, scrollbar: Rec
     let clock = app.clock;
     let animate = app.animate;
     let info = &app.info;
+    let tools_open = app.settings.tool_results == ToolResultView::Expanded;
+    let gap = match app.settings.density {
+        Density::Comfortable => crate::transcript::BlockGap,
+        Density::Compact => 0,
+    };
     let Some(live) = app.sessions.get_mut(app.active) else {
         return;
     };
@@ -358,6 +431,8 @@ fn draw_transcript(app: &mut app_t, buf: &mut Buffer, area: Rect, scrollbar: Rec
         animate,
         info,
         logo_start: live.logo_from,
+        tools_open,
+        gap,
     };
     let previous_total = live.scroll.total;
     live.view.prepare(&live.transcript, &ctx);
@@ -908,11 +983,24 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
     let busy = app.busy();
     let mut hints: Vec<(&str, &str, Option<Action>)> = Vec::new();
     let dragging_row = app.grab.as_ref().is_some_and(|g| g.moved);
-    let sidebar_modal = matches!(modal, Modal::Prompt | Modal::Confirm | Modal::Move);
+    let sidebar_modal = matches!(
+        modal,
+        Modal::Prompt | Modal::Confirm | Modal::Move | Modal::Menu
+    );
     match (modal, app.focus) {
         _ if dragging_row => {
             hints.push(("release", "on a folder", None));
             hints.push(("esc", "cancel", None));
+        }
+        (Modal::Menu, _) => {
+            hints.push(("j/k", "choose", None));
+            hints.push(("enter", "pick", Some(Action::Menu(MenuAction::Enter))));
+            hints.push(("→", "open", None));
+            hints.push(("esc", "close", Some(Action::Menu(MenuAction::Back))));
+        }
+        (Modal::Confirm, _) if app.delete_plan.is_some() => {
+            hints.push(("enter", "delete", Some(Action::ConfirmYes)));
+            hints.push(("n", "cancel", Some(Action::SidebarCancel)));
         }
         (Modal::Prompt, _) => {
             let verb = match app.prompt.as_ref().map(|p| &p.kind) {
@@ -945,19 +1033,34 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
             hints.push(("enter", "send", Some(Action::QuestionSubmit)));
         }
         (Modal::Help, _) => hints.push(("any key", "close", Some(Action::ToggleHelp))),
+        (Modal::None, Focus::Settings) => page_hints(app, &mut hints),
         (Modal::None, Focus::Transcript) => {
             hints.push(("j/k", "select", None));
             hints.push(("enter", "expand", Some(Action::ToggleSelected)));
             hints.push(("i", "input", Some(Action::SetFocus(Focus::Input))));
         }
+        (Modal::None, Focus::Sidebar) if app.selection.len() > 1 => {
+            hints.push((".", "menu", Some(Action::Menu(MenuAction::OpenKeys))));
+            hints.push(("m", "move", Some(Action::PickUp)));
+            hints.push(("d", "delete", Some(Action::DeleteRows)));
+            hints.push(("esc", "clear", Some(Action::Select(SelectAction::Clear))));
+        }
         (Modal::None, Focus::Sidebar) => {
             hints.push(("j/k", "select", None));
             hints.push(("enter", "open", Some(Action::SidebarActivate)));
+            hints.push((".", "menu", Some(Action::Menu(MenuAction::OpenKeys))));
             hints.push(("f", "folder", Some(Action::NewSubfolder)));
             hints.push(("m", "move", Some(Action::PickUp)));
             hints.push(("n", "new", Some(Action::NewChat)));
         }
         (Modal::None, Focus::Input) => {
+            // The first hints are the first to go when the row is short.
+            hints.push(("ctrl+o", "settings", Some(Action::Page(PageAction::Open))));
+            if app.sessions.len() > 1 {
+                hints.push(("alt+1-9", "tabs", None));
+            } else {
+                hints.push(("ctrl+t", "new tab", Some(Action::Tab(TabAction::New))));
+            }
             if busy {
                 hints.push(("enter", "queue", None));
             } else {
@@ -966,10 +1069,10 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
             }
         }
     }
-    if busy && !sidebar_modal && !dragging_row {
+    if busy && !sidebar_modal && !dragging_row && !app.page_shown {
         hints.push(("esc", "stop", Some(Action::Cancel)));
     }
-    if !sidebar_modal && !dragging_row {
+    if !sidebar_modal && !dragging_row && app.focus != Focus::Settings {
         hints.push(("tab", "focus", Some(Action::FocusNext)));
     }
     hints.push(("ctrl+b", "sidebar", Some(Action::ToggleSidebar)));
@@ -1021,6 +1124,41 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
     }
 }
 
+/// The status hints while the settings page has the keys.
+fn page_hints(app: &app_t, hints: &mut Vec<(&'static str, &'static str, Option<Action>)>) {
+    let keys = app
+        .page
+        .as_ref()
+        .map(crate::settings_page::settings_page_t::keys)
+        .unwrap_or(PageKeys::Browse);
+    match keys {
+        PageKeys::Prompt => {
+            hints.push((
+                "enter",
+                "import",
+                Some(Action::Page(PageAction::PromptSubmit)),
+            ));
+            hints.push(("esc", "cancel", None));
+        }
+        PageKeys::Confirm => {
+            hints.push((
+                "enter",
+                "confirm",
+                Some(Action::Page(PageAction::ConfirmYes)),
+            ));
+            hints.push(("n", "keep", Some(Action::Page(PageAction::ConfirmNo))));
+        }
+        PageKeys::Browse => {
+            hints.push(("r", "reset", Some(Action::Page(PageAction::ResetCursor))));
+            hints.push(("j/k", "move", None));
+            hints.push(("←→", "choose", None));
+            hints.push(("enter", "change", Some(Action::Page(PageAction::Activate))));
+            hints.push(("tab", "pane", Some(Action::Page(PageAction::Cycle(1)))));
+            hints.push(("esc", "close", Some(Action::Page(PageAction::Close))));
+        }
+    }
+}
+
 fn draw_side(app: &mut app_t, buf: &mut Buffer, area: Rect, drawer: bool) {
     let phase_text = app.phase_text();
     let theme = app.theme.clone();
@@ -1047,6 +1185,19 @@ fn draw_side(app: &mut app_t, buf: &mut Buffer, area: Rect, drawer: bool) {
         ghost: if dragging { app.moving_title() } else { None },
         overlay: overlay.as_ref(),
         chips: app.options.mouse && app.moving().is_none() && overlay.is_none(),
+        selected_count: if app.selection.shown() {
+            app.selection.len()
+        } else {
+            0
+        },
+        sections: sidebar_sections_t {
+            context: app.settings.show_context,
+            turn: app.settings.show_turn,
+            generation: app.settings.show_generation,
+            model: app.settings.show_model,
+        },
+        compact: app.settings.density == Density::Compact,
+        page_shown: app.page_shown,
     };
     let out = draw_sidebar(buf, area, &input, &theme, &mut app.hits);
     app.sidebar_scroll = out.scroll;

@@ -11,7 +11,7 @@ use crate::text::{line_t, sanitize, span_t, truncate};
 use crate::theme::theme_t;
 
 /// Keys, as (key, what it does). The parity test checks the mouse table against these.
-pub const Keys: [(&str, &str); 31] = [
+pub const Keys: &[(&str, &str)] = &[
     ("enter", "send the message (queued while a turn runs)"),
     ("ctrl+j · alt+enter", "new line in the message"),
     (
@@ -25,11 +25,27 @@ pub const Keys: [(&str, &str); 31] = [
     ("ctrl+d", "quit when the input is empty"),
     ("tab · shift+tab", "move focus: input, transcript, sidebar"),
     ("ctrl+b", "show or hide the sidebar (a drawer when narrow)"),
-    ("ctrl+n", "new chat"),
+    ("ctrl+n", "new chat (reuses an unused New chat tab)"),
+    (
+        "ctrl+t · alt+w",
+        "new tab · close the tab (a running turn stops first)",
+    ),
+    (
+        "alt+. · alt+,",
+        "next · previous tab (also ctrl+pgdn · ctrl+pgup)",
+    ),
+    ("alt+1-9 · alt+0", "go to tab 1 to 9 · the last tab"),
+    (
+        "shift+f10",
+        "menu of the sidebar row or selection, else of the tab",
+    ),
     ("ctrl+f", "new folder at the top level"),
+    (
+        "ctrl+o · f2",
+        "the settings page (also /settings, sidebar s, ⚙ settings)",
+    ),
     ("ctrl+y", "copy the last reply through OSC 52"),
     ("ctrl+x", "clear queued messages"),
-    ("ctrl+t", "turn the generation effect on or off"),
     ("ctrl+l", "redraw the screen"),
     ("? · f1", "this help (? when the input is empty)"),
     ("pgup · pgdn", "scroll the transcript a page"),
@@ -50,17 +66,48 @@ pub const Keys: [(&str, &str); 31] = [
         "expand or fold the selected tool or attempt",
     ),
     ("navigate: g · G · i", "top · latest · back to the input"),
-    ("sidebar: j k enter n", "select · open or fold · new chat"),
+    ("sidebar: j k enter n", "move · open or fold · new chat"),
     ("sidebar: ← →", "fold · unfold a folder"),
     (
-        "sidebar: f r d",
-        "new sub-folder · rename · delete folder (contents move up)",
+        "sidebar: shift+↑↓ · J K",
+        "select from the anchor to the row (extends the selection)",
+    ),
+    (
+        "sidebar: ctrl+space · ctrl+a",
+        "add or remove the row · select every row; esc clears",
+    ),
+    ("sidebar: .", "the menu of the row, or of the selection"),
+    ("sidebar: s", "open the settings page"),
+    (
+        "sidebar: f r p d",
+        "new sub-folder · rename · pin · delete (asks first)",
     ),
     (
         "sidebar: m",
         "pick up a row; j k choose a folder, enter drops, esc cancels",
     ),
     ("folder name: enter · esc", "create or rename · cancel"),
+    (
+        "menu: j k enter → ← esc",
+        "choose · run · open a submenu · back · close; 1-9 pick",
+    ),
+    ("delete: enter · y · n", "delete · delete · keep"),
+    (
+        "settings: j k · tab",
+        "move · section list, rows, then the sidebar",
+    ),
+    (
+        "settings: enter · ← →",
+        "change the row · previous or next option; 1-6 a section",
+    ),
+    (
+        "settings: r · d",
+        "reset the row to its default · remove an imported theme",
+    ),
+    (
+        "settings: esc",
+        "close the import prompt or the question, then the page",
+    ),
     (
         "approval: y a n",
         "allow once · allow for the session · deny",
@@ -72,7 +119,7 @@ pub const Keys: [(&str, &str); 31] = [
     ),
 ];
 
-pub const Mouse: [(&str, &str); 12] = [
+pub const Mouse: &[(&str, &str)] = &[
     (
         "wheel",
         "scroll the transcript or the sidebar under the pointer",
@@ -91,14 +138,40 @@ pub const Mouse: [(&str, &str); 12] = [
     ),
     ("+ folder", "the button beside conversations: a new folder"),
     (
+        "ctrl+click",
+        "add or remove a row from the selection (alt+click also)",
+    ),
+    (
+        "shift+click",
+        "select from the anchor to the row; ctrl+shift adds the range",
+    ),
+    (
+        "☐ chip",
+        "on hover: add or remove the row from the selection",
+    ),
+    ("right click", "a row, a selection or a tab: its menu"),
+    (
+        "tabs",
+        "click shows · middle click or × closes · + new · wheel scrolls",
+    ),
+    (
         "drag a row",
-        "onto a folder to move it in, onto conversations for the top level",
+        "onto a folder to move it in (a selected row moves the selection)",
     ),
     (
         "row chips",
         "on hover: + sub-folder · ✎ rename · ⇢ move · ✕ delete",
     ),
     ("↓ new chip", "jump to the latest message"),
+    (
+        "⚙ settings",
+        "bottom right of the sidebar: opens the settings page",
+    ),
+    (
+        "settings page",
+        "click a section, a chip or a theme; hover a theme to preview it",
+    ),
+    ("settings tab", "click shows the page · × closes it"),
     (
         "shift+drag",
         "select text natively; the UI owns plain drags",

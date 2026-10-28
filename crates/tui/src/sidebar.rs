@@ -7,14 +7,17 @@
 //! indentation and faint guide rails, and a move (drag or pick-up, D55) by tone steps.
 
 use harness::api::{SessionPhase, runtime_info_t};
+use harness::organize::TagColor;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::banner::{chip, short_path};
 use crate::canvas::{fill, put_line, put_str, put_str_right};
-use crate::input::{Action, Target, hit_registry_t};
+use crate::input::{Action, MenuAction, SelectAction, Target, hit_registry_t};
+use crate::settings_page::PageAction;
 use crate::strip::strip_line;
+use crate::tags::{CheckOff, CheckOn, PinGlyph, TagDot, tag_rgb};
 use crate::text::{
     clusters, format_ms, group_digits, line_t, sanitize, str_width, truncate, wrap_plain,
 };
@@ -25,7 +28,10 @@ use crate::view_model::transcript_t;
 pub enum Activity {
     Idle,
     Generating,
+    /// Waiting for the user: an approval or a question.
     Waiting,
+    /// Running a tool.
+    Tool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,9 +75,33 @@ pub struct sidebar_item_t {
     /// Nesting level in the tree: 0 for top-level folders and unfiled conversations.
     pub depth: usize,
     pub mark: MoveMark,
+    /// A conversation's own settings (D57).
+    pub pinned: bool,
+    pub color: Option<TagColor>,
+    pub archived: bool,
+    /// In a selection that shows (D60).
+    pub selected: bool,
 }
 
 impl sidebar_item_t {
+    /// A row with this kind and title and every other field at its plain value.
+    pub fn label(kind: SidebarItemKind, title: String) -> Self {
+        sidebar_item_t {
+            kind,
+            title,
+            detail: String::new(),
+            active: false,
+            activity: Activity::Idle,
+            demo: false,
+            depth: 0,
+            mark: MoveMark::None,
+            pinned: false,
+            color: None,
+            archived: false,
+            selected: false,
+        }
+    }
+
     /// A row of the scrolled tree (not the new-chat button or the "conversations" label).
     pub fn in_tree(&self) -> bool {
         matches!(
@@ -125,9 +155,41 @@ pub struct sidebar_input_t<'a> {
     /// The title being dragged, shown as a ghost label at the pointer.
     pub ghost: Option<String>,
     pub overlay: Option<&'a overlay_t>,
-    /// Show the row chips (new sub-folder, rename, move, delete) on the hovered or selected row.
+    /// Show the row chips (select, new sub-folder, rename, move, delete) on the hovered or
+    /// cursor row.
     pub chips: bool,
+    /// Rows in the selection, when it shows. Two or more get the selection line (D60).
+    pub selected_count: usize,
+    /// Which sections show, by the `show_*` settings (D63).
+    pub sections: sidebar_sections_t,
+    /// The compact density: no blank rows between the sections (D63).
+    pub compact: bool,
+    /// The settings page shows, so its footer button is lit (D65).
+    pub page_shown: bool,
 }
+
+/// The sections above the conversation list that show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct sidebar_sections_t {
+    pub context: bool,
+    pub turn: bool,
+    pub generation: bool,
+    pub model: bool,
+}
+
+impl Default for sidebar_sections_t {
+    fn default() -> Self {
+        sidebar_sections_t {
+            context: true,
+            turn: true,
+            generation: true,
+            model: true,
+        }
+    }
+}
+
+/// The footer button that opens the settings page (D65).
+pub const SettingsButton: &str = " ⚙ settings ";
 
 /// What drawing the sidebar decided.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -229,7 +291,9 @@ fn sections(input: &sidebar_input_t<'_>, inner: usize, theme: &theme_t) -> Vec<(
             )));
         }
     }
-    out.push((0, rows));
+    if input.sections.context {
+        out.push((0, rows));
+    }
 
     // Turn.
     let mut rows = Vec::new();
@@ -256,7 +320,9 @@ fn sections(input: &sidebar_input_t<'_>, inner: usize, theme: &theme_t) -> Vec<(
             theme,
         )));
     }
-    out.push((0, rows));
+    if input.sections.turn {
+        out.push((0, rows));
+    }
 
     // Generation.
     let mut rows = Vec::new();
@@ -340,7 +406,9 @@ fn sections(input: &sidebar_input_t<'_>, inner: usize, theme: &theme_t) -> Vec<(
         },
         theme,
     )));
-    out.push((1, rows));
+    if input.sections.generation {
+        out.push((1, rows));
+    }
 
     // Model.
     let mut rows = Vec::new();
@@ -370,7 +438,9 @@ fn sections(input: &sidebar_input_t<'_>, inner: usize, theme: &theme_t) -> Vec<(
     {
         rows.push(srow_t::text(l));
     }
-    out.push((2, rows));
+    if input.sections.model {
+        out.push((2, rows));
+    }
     out
 }
 
@@ -418,7 +488,13 @@ fn tail(text: &str, width: usize) -> String {
 }
 
 /// A one-line editor: the text around a block cursor, scrolled so the cursor stays in view.
-fn prompt_line(text: &str, cursor: usize, width: usize, bg: Color, theme: &theme_t) -> line_t {
+pub(crate) fn prompt_line(
+    text: &str,
+    cursor: usize,
+    width: usize,
+    bg: Color,
+    theme: &theme_t,
+) -> line_t {
     let cursor = cursor.min(text.len());
     let before = sanitize(text.get(..cursor).unwrap_or(""), false);
     let after = sanitize(text.get(cursor..).unwrap_or(""), false);
@@ -569,6 +645,8 @@ pub fn draw_sidebar(
     let base = Style::new().bg(bg);
     let mut y = area.y.saturating_add(1);
     let bottom = area.bottom();
+    // Blank rows between the parts of the column: none with the compact density.
+    let gap = u16::from(!input.compact);
 
     // Title.
     put_str(
@@ -592,7 +670,7 @@ pub fn draw_sidebar(
                 .add_modifier(Modifier::BOLD),
         );
     }
-    y = y.saturating_add(2);
+    y = y.saturating_add(1 + gap);
 
     // New chat button.
     let button = Rect::new(x0, y, x1.saturating_sub(x0), 1);
@@ -638,7 +716,7 @@ pub fn draw_sidebar(
         Style::new().fg(theme.fg_faint).bg(button_bg),
     );
     hits.add(button, Action::NewChat);
-    y = y.saturating_add(2);
+    y = y.saturating_add(1 + gap);
 
     // Footer: cwd and version, at the very bottom.
     let footer_h = 3u16;
@@ -648,7 +726,7 @@ pub fn draw_sidebar(
     let mut secs = sections(input, inner, theme);
     let min_list = 6usize;
     loop {
-        let need: usize = secs.iter().map(|(_, r)| r.len() + 1).sum();
+        let need: usize = secs.iter().map(|(_, r)| r.len() + usize::from(gap)).sum();
         let avail = footer_y.saturating_sub(y) as usize;
         if need + min_list <= avail || secs.len() <= 1 {
             break;
@@ -680,7 +758,7 @@ pub fn draw_sidebar(
             }
             y = y.saturating_add(1);
         }
-        y = y.saturating_add(1);
+        y = y.saturating_add(gap);
     }
 
     // Conversations.
@@ -694,6 +772,10 @@ pub fn draw_sidebar(
         };
         draw_root(buf, &ctx, y, hits);
         y = y.saturating_add(1);
+        if input.selected_count > 1 && y < footer_y.saturating_sub(2) {
+            draw_selection_line(buf, &ctx, y, hits);
+            y = y.saturating_add(1);
+        }
         let overlay = input
             .overlay
             .map(|o| {
@@ -790,12 +872,56 @@ pub fn draw_sidebar(
             ""
         }
     );
+    // The settings button sits at the right of the version row; the version gives way first.
+    let vy = fy.saturating_add(1);
+    let button_w = str_width(SettingsButton) as u16;
+    let bx = x1.saturating_sub(button_w).max(x0);
+    let button = Rect::new(bx, vy, x1.saturating_sub(bx), 1);
+    let over = input
+        .hover
+        .is_some_and(|(hx, hy)| button.contains(Position::new(hx, hy)));
+    let (button_fg, button_bg) = match (input.page_shown, over) {
+        (_, true) => (theme.fg, theme.select),
+        (true, false) => (theme.fg, theme.hover),
+        (false, false) => (theme.fg_dim, theme.inset),
+    };
+    let gear_x = put_str(
+        buf,
+        bx,
+        vy,
+        x1,
+        " ⚙",
+        Style::new()
+            .fg(if input.page_shown {
+                theme.ice
+            } else {
+                button_fg
+            })
+            .bg(button_bg),
+    );
+    put_str(
+        buf,
+        gear_x,
+        vy,
+        x1,
+        " settings ",
+        Style::new().fg(button_fg).bg(button_bg),
+    );
+    hits.add(button, Action::Page(PageAction::Open));
+    let room = usize::from(bx.saturating_sub(x0).saturating_sub(1));
+    // " · demo" goes first, then the name, before the version number is cut: the DEMO chip at
+    // the top stays, and the title says ncagent.
+    let number = truncate(&sanitize(&input.info.version, false), 12);
+    let version = [version, format!("ncagent {number}"), format!("v{number}")]
+        .into_iter()
+        .find(|v| str_width(v) <= room)
+        .unwrap_or_else(|| format!("v{number}"));
     put_str(
         buf,
         x0,
-        fy.saturating_add(1),
-        x1,
-        &version,
+        vy,
+        bx.saturating_sub(1),
+        &truncate(&version, room),
         base.fg(theme.fg_faint),
     );
 
@@ -928,6 +1054,59 @@ fn draw_root(buf: &mut Buffer, ctx: &tree_ctx_t<'_, '_>, y: u16, hits: &mut hit_
     }
 }
 
+/// The line under "conversations" while several rows are selected: how many, a chip for their
+/// menu and a chip that clears the selection (D60, D61).
+fn draw_selection_line(
+    buf: &mut Buffer,
+    ctx: &tree_ctx_t<'_, '_>,
+    y: u16,
+    hits: &mut hit_registry_t,
+) {
+    let (area, input, theme) = (ctx.area, ctx.input, ctx.theme);
+    let x0 = area.x.saturating_add(2);
+    let x1 = area.right().saturating_sub(2);
+    let rect = Rect::new(area.x, y, area.width, 1);
+    let tone = theme.marked;
+    fill(buf, rect, Style::new().bg(tone));
+    let st = Style::new().bg(tone);
+    put_str(buf, area.x, y, area.right(), "▎", st.fg(theme.ice));
+    let mut cx = x1;
+    for (glyph, action) in [
+        (" ✕ ", Action::Select(SelectAction::Clear)),
+        (" ⋯ ", Action::Menu(MenuAction::OpenSelection)),
+    ] {
+        cx = cx.saturating_sub(3);
+        let chip = Rect::new(cx, y, 3, 1);
+        let over = input
+            .hover
+            .is_some_and(|(hx, hy)| chip.contains(Position::new(hx, hy)));
+        let (fg, chip_bg) = if over {
+            (theme.fg, theme.select)
+        } else {
+            (theme.fg_dim, mix(tone, theme.fg, 0.08))
+        };
+        put_str(buf, cx, y, x1, glyph, Style::new().fg(fg).bg(chip_bg));
+        hits.add(chip, action);
+    }
+    let text = format!("{} selected", input.selected_count);
+    let nx = put_str(
+        buf,
+        x0,
+        y,
+        cx.saturating_sub(1),
+        &text,
+        st.fg(theme.fg).add_modifier(Modifier::BOLD),
+    );
+    put_str(
+        buf,
+        nx.saturating_add(1),
+        y,
+        cx.saturating_sub(1),
+        "esc clears",
+        st.fg(theme.fg_faint),
+    );
+}
+
 fn draw_overlay_row(
     buf: &mut Buffer,
     area: Rect,
@@ -966,9 +1145,14 @@ fn draw_overlay_row(
 
 /// The chips a row offers on hover or selection, as (glyph, action).
 fn row_chips(index: usize, item: &sidebar_item_t) -> Vec<(&'static str, Action)> {
+    let check = (
+        if item.selected { CheckOn } else { CheckOff },
+        Action::Select(SelectAction::ToggleAt(index)),
+    );
     match &item.kind {
         SidebarItemKind::Folder { .. } => {
-            let mut chips = Vec::with_capacity(4);
+            let mut chips = Vec::with_capacity(5);
+            chips.push(check);
             // A top-level folder is level 1, so a folder at depth d is level d + 1.
             if item.depth + 1 < harness::organize::MaxFolderDepth {
                 chips.push(("+", Action::NewSubfolderAt(index)));
@@ -978,7 +1162,7 @@ fn row_chips(index: usize, item: &sidebar_item_t) -> Vec<(&'static str, Action)>
             chips.push(("✕", Action::DeleteFolderAt(index)));
             chips
         }
-        SidebarItemKind::Session { .. } => vec![("⇢", Action::PickUpAt(index))],
+        SidebarItemKind::Session { .. } => vec![check, ("⇢", Action::PickUpAt(index))],
         _ => Vec::new(),
     }
 }
@@ -1008,6 +1192,10 @@ fn draw_tree_row(
         hot_bg(bg, theme)
     } else if item.mark == MoveMark::Source {
         theme.inset
+    } else if item.selected && (selected || hovered) && !moving {
+        mix(theme.marked, theme.fg, 0.06)
+    } else if item.selected {
+        theme.marked
     } else if item.active {
         theme.select
     } else if (selected || hovered) && !moving {
@@ -1022,6 +1210,8 @@ fn draw_tree_row(
         put_str(buf, area.x, y, area.right(), "▌", st.fg(rail));
     } else if item.active {
         put_str(buf, area.x, y, area.right(), "▌", st.fg(theme.agent));
+    } else if item.selected {
+        put_str(buf, area.x, y, area.right(), "▎", st.fg(theme.ice));
     }
     if selected && !moving {
         put_str(
@@ -1067,6 +1257,7 @@ fn draw_tree_row(
                 let (fg, chip_bg) = match (over, glyph) {
                     (true, "✕") => (theme.error, theme.select),
                     (true, _) => (theme.fg, theme.select),
+                    (false, CheckOn) => (theme.ice, theme.inset),
                     (false, _) => (theme.fg_dim, theme.inset),
                 };
                 put_str(
@@ -1130,6 +1321,15 @@ fn draw_tree_row(
         SidebarItemKind::Session { .. } => {
             if item.mark == MoveMark::Source {
                 put_str(buf, text_x.saturating_sub(2), y, x1, "⇢", st.fg(theme.ice));
+            } else if let Some(color) = item.color {
+                put_str(
+                    buf,
+                    text_x.saturating_sub(2),
+                    y,
+                    x1,
+                    TagDot,
+                    st.fg(tag_rgb(color)),
+                );
             }
             let detail_w = if show_chips && right_start < x1 {
                 0
@@ -1147,11 +1347,25 @@ fn draw_tree_row(
                 .saturating_sub(detail_w + tag_w + dot_w + 1);
             let title_style = match item.mark {
                 MoveMark::Inert | MoveMark::Source => st.fg(theme.fg_faint),
+                _ if item.archived => st.fg(theme.fg_faint),
                 _ if item.active => st.fg(theme.fg).add_modifier(Modifier::BOLD),
+                _ if item.selected => st.fg(theme.fg),
                 _ => st.fg(theme.fg_dim),
             };
-            let title = truncate(&item.title, title_end.saturating_sub(text_x) as usize);
-            put_str(buf, text_x, y, title_end, &title, title_style);
+            let mut tx = text_x;
+            if item.pinned {
+                tx = put_str(
+                    buf,
+                    tx,
+                    y,
+                    title_end,
+                    PinGlyph,
+                    st.fg(mix(row_bg, theme.question, 0.85)),
+                );
+                tx = tx.saturating_add(1);
+            }
+            let title = truncate(&item.title, title_end.saturating_sub(tx) as usize);
+            put_str(buf, tx, y, title_end, &title, title_style);
             let mut rx = right_start.min(x1);
             if detail_w > 0 {
                 rx = put_str_right(buf, rx, y, x0, &item.detail, st.fg(theme.fg_faint));
@@ -1205,5 +1419,6 @@ fn activity_dot(activity: Activity, theme: &theme_t, pulse: f32) -> Option<(&'st
         Activity::Idle => None,
         Activity::Generating => Some(("● ", mix(theme.ice_deep, theme.ice, pulse))),
         Activity::Waiting => Some(("● ", theme.approval)),
+        Activity::Tool => Some(("● ", theme.tool)),
     }
 }

@@ -6,28 +6,34 @@
 //! ratatui `Frame` (see `draw`), and bytes for the terminal (OSC 52) are queued in `outputs`
 //! for the loop to write.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use crossterm::event::{Event, KeyCode, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
 use harness::api::{SessionPhase, runtime_info_t, runtime_t, session_t};
 use harness::approval::{ApprovalDecision, ApprovalMode};
 use harness::event::SessionEvent;
 use harness::organize::organization_t;
+use harness::settings::settings_t;
 use harness::store::session_summary_t;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 
 use crate::clipboard::osc52;
 use crate::commands::{self, Command};
 use crate::composer::{EditOp, composer_t};
+use crate::conversation::delete_plan_t;
 use crate::folders::{MoveSource, grab_t, prompt_t};
 use crate::input::{
-    Action, Focus, Modal, MouseIntent, hit_registry_t, key_ctx_t, map_key, map_mouse,
+    Action, Focus, Modal, MouseIntent, hit_registry_t, key_ctx_t, map_key, map_mouse, wheel_areas_t,
 };
-use crate::layout::{DockWidth, SidebarMode, layout_t};
-use crate::sidebar::{Activity, MoveMark, SidebarItemKind, sidebar_item_t};
-use crate::text::{format_age, sanitize, truncate};
+use crate::layout::{SidebarMode, layout_t};
+use crate::menu::menu_t;
+use crate::selection::{ClickKind, selection_t};
+use crate::settings_page::{PageKeys, settings_page_t};
+use crate::sidebar::{Activity, SidebarItemKind, sidebar_item_t};
+use crate::text::{sanitize, truncate};
 use crate::theme::{ColorMode, theme_t};
+use crate::theme_set::theme_set_t;
 use crate::transcript::transcript_view_t;
 use crate::view_model::transcript_t;
 
@@ -127,7 +133,18 @@ impl scroll_t {
     }
 }
 
-/// One opened session and everything the UI keeps for it.
+/// Whether a tab that is not shown has news for the user (D62).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attention {
+    None,
+    /// A turn ended while the tab was not shown.
+    Finished,
+    /// An approval or a question arrived while the tab was not shown.
+    NeedsYou,
+}
+
+/// One open tab: a session and everything the UI keeps for it. Each tab keeps its own draft,
+/// scroll position, selected block and expanded blocks, so switching tabs loses none of them.
 pub struct live_session_t {
     pub session: Box<dyn session_t>,
     pub transcript: transcript_t,
@@ -141,10 +158,14 @@ pub struct live_session_t {
     /// App-clock time the title card's logo started its reveal (D56). `None` when it shows
     /// settled: animation off, a replayed session, the reveal done, or the card off screen.
     pub logo_from: Option<u64>,
+    /// The composer text of this tab while another tab is shown. The shown tab's text lives in
+    /// `app_t::composer`, and this field is empty then.
+    pub draft: composer_t,
+    pub attention: Attention,
 }
 
 impl live_session_t {
-    fn new(session: Box<dyn session_t>) -> Self {
+    pub(crate) fn new(session: Box<dyn session_t>) -> Self {
         let phase = session.phase();
         live_session_t {
             session,
@@ -156,11 +177,27 @@ impl live_session_t {
             queued: Vec::new(),
             resolved: HashSet::new(),
             logo_from: None,
+            draft: composer_t::new(),
+            attention: Attention::None,
         }
     }
 
     pub fn busy(&self) -> bool {
         self.phase.busy()
+    }
+
+    /// True once the user sent a message in this conversation.
+    pub fn has_messages(&self) -> bool {
+        self.transcript
+            .blocks
+            .iter()
+            .any(|b| matches!(b.kind, crate::view_model::BlockKind::User { .. }))
+    }
+
+    /// A New chat nobody used yet: idle, with no message and nothing queued. Its draft is
+    /// checked by the caller, because the shown tab's draft is in the composer.
+    pub fn untouched(&self) -> bool {
+        !self.busy() && !self.has_messages() && self.queued.is_empty()
     }
 
     pub fn title(&self) -> String {
@@ -176,11 +213,12 @@ impl live_session_t {
             .unwrap_or_else(|| "New chat".to_string())
     }
 
-    fn activity(&self) -> Activity {
+    pub fn activity(&self) -> Activity {
         match self.phase {
             SessionPhase::Idle => Activity::Idle,
             SessionPhase::AwaitingApproval | SessionPhase::AwaitingAnswer => Activity::Waiting,
-            _ => Activity::Generating,
+            SessionPhase::RunningTool => Activity::Tool,
+            SessionPhase::Generating | SessionPhase::Cancelling => Activity::Generating,
         }
     }
 }
@@ -188,13 +226,32 @@ impl live_session_t {
 pub struct app_t {
     pub runtime: Arc<dyn runtime_t>,
     pub info: runtime_info_t,
+    /// The palette every frame draws with: the theme of the settings, or the page's preview.
     pub theme: theme_t,
+    /// The id `theme` was resolved from. Cleared to make the next frame resolve it again.
+    pub theme_id: String,
+    /// The built-in themes and the imported ones (D64).
+    pub themes: theme_set_t,
     pub options: app_options_t,
+    /// The user's settings as last loaded or saved (D63).
+    pub settings: settings_t,
+    /// False when the settings file did not load: the defaults are in use, and nothing the app
+    /// saves on its own overwrites the file (D70).
+    pub settings_ok: bool,
+    /// The open tabs, in tab order (D62).
     pub sessions: Vec<live_session_t>,
+    /// The shown tab.
     pub active: usize,
+    /// Tabs closed while they ran: cancelled, and pumped until they stop so their logs end
+    /// cleanly, then dropped.
+    pub closing: Vec<live_session_t>,
+    /// The first tab drawn when the tab bar overflows.
+    pub tab_scroll: usize,
+    /// The tab the bar last scrolled into view, so a change of tab brings the new one in.
+    pub tab_shown: Option<usize>,
     pub summaries: Vec<session_summary_t>,
     summaries_at: u64,
-    summaries_dirty: bool,
+    pub(crate) summaries_dirty: bool,
     pub composer: composer_t,
     pub focus: Focus,
     pub sidebar_pinned: bool,
@@ -210,14 +267,27 @@ pub struct app_t {
     pub folded: BTreeSet<String>,
     /// The folder-name prompt, when open.
     pub prompt: Option<prompt_t>,
-    /// The folder whose delete waits for confirmation.
+    /// The folder whose delete waits for confirmation in the sidebar.
     pub confirm: Option<String>,
+    /// The delete of conversations (and folders) that waits in the dialog (D59).
+    pub delete_plan: Option<delete_plan_t>,
+    /// The rows selected in the sidebar (D60).
+    pub selection: selection_t,
+    /// The context menu, when open (D61).
+    pub menu: Option<menu_t>,
+    /// Where the menu and the delete dialog were drawn in the last frame. A press outside
+    /// them closes them.
+    pub overlay_areas: Vec<Rect>,
     /// Pick-up mode: what is being moved (D55).
     pub pickup: Option<MoveSource>,
     /// A sidebar row held by the mouse.
     pub grab: Option<grab_t>,
     pub help_open: bool,
     pub help_scroll: usize,
+    /// The settings page, while it is open (D65).
+    pub page: Option<settings_page_t>,
+    /// The page is the view of the main panel. It can be open and hidden behind a tab.
+    pub page_shown: bool,
     pub approval_sel: usize,
     approval_for: Option<String>,
     pub question_sel: usize,
@@ -235,6 +305,8 @@ pub struct app_t {
     pub outputs: Vec<Vec<u8>>,
     pub size: (u16, u16),
     pub layout: layout_t,
+    /// The generation effect, the logo reveal and the pulses: allowed by the command line and
+    /// turned on in the settings (D63).
     pub animate: bool,
     pub redraw: bool,
 }
@@ -253,19 +325,21 @@ impl app_t {
         now_ms: u64,
     ) -> Result<Self, start_error_t> {
         let info = runtime.info().clone();
-        let session = runtime.new_session().map_err(|e| start_error_t {
-            message: format!("could not start a session: {e}"),
-        })?;
-        let mut first = live_session_t::new(session);
-        first.logo_from = options.animate.then_some(clock);
         let mut app = app_t {
             runtime,
             info,
             theme: theme_t::dark(),
+            theme_id: String::new(),
+            themes: theme_set_t::default(),
             animate: options.animate,
             options,
-            sessions: vec![first],
+            settings: settings_t::default(),
+            settings_ok: false,
+            sessions: Vec::new(),
             active: 0,
+            closing: Vec::new(),
+            tab_scroll: 0,
+            tab_shown: None,
             summaries: Vec::new(),
             summaries_at: 0,
             summaries_dirty: true,
@@ -281,10 +355,16 @@ impl app_t {
             folded: BTreeSet::new(),
             prompt: None,
             confirm: None,
+            delete_plan: None,
+            selection: selection_t::default(),
+            menu: None,
+            overlay_areas: Vec::new(),
             pickup: None,
             grab: None,
             help_open: false,
             help_scroll: 0,
+            page: None,
+            page_shown: false,
             approval_sel: 0,
             approval_for: None,
             question_sel: 0,
@@ -304,8 +384,26 @@ impl app_t {
             layout: layout_t::default(),
             redraw: false,
         };
+        app.load_settings();
+        let notes = app.load_themes();
+        app.settings_changed();
+        if !notes.is_empty() {
+            app.say_more(notes.join(" · "), ToastKind::Warning);
+        }
         app.refresh_summaries();
         app.load_organization();
+        app.restore_tabs();
+        if app.sessions.is_empty() {
+            let session = app.runtime.new_session().map_err(|e| start_error_t {
+                message: format!("could not start a session: {e}"),
+            })?;
+            let mut first = live_session_t::new(session);
+            first.logo_from = app.animate.then_some(clock);
+            app.apply_approval(&mut first);
+            app.sessions.push(first);
+            app.active = 0;
+        }
+        app.tabs_changed();
         app.rebuild_sidebar_items();
         Ok(app)
     }
@@ -314,7 +412,7 @@ impl app_t {
         self.sessions.get(self.active)
     }
 
-    fn active_mut(&mut self) -> Option<&mut live_session_t> {
+    pub(crate) fn active_mut(&mut self) -> Option<&mut live_session_t> {
         self.sessions.get_mut(self.active)
     }
 
@@ -340,7 +438,23 @@ impl app_t {
         });
     }
 
-    fn refresh_summaries(&mut self) {
+    /// A toast that keeps the one showing, for messages at start that come one after another.
+    pub(crate) fn say_more(&mut self, text: impl Into<String>, kind: ToastKind) {
+        let text = text.into();
+        match self.toast.take() {
+            Some(t) if self.clock <= t.until => {
+                let kind = match (t.kind, kind) {
+                    (ToastKind::Error, _) | (_, ToastKind::Error) => ToastKind::Error,
+                    (ToastKind::Warning, _) | (_, ToastKind::Warning) => ToastKind::Warning,
+                    _ => ToastKind::Info,
+                };
+                self.say(format!("{} · {text}", t.text), kind);
+            }
+            _ => self.say(text, kind),
+        }
+    }
+
+    pub(crate) fn refresh_summaries(&mut self) {
         match self.runtime.list_sessions() {
             Ok(list) => self.summaries = list,
             Err(err) => self.say(
@@ -357,7 +471,10 @@ impl app_t {
         self.clock = clock;
         self.now_ms = now_ms;
         let mut turn_ended = false;
-        for live in self.sessions.iter_mut() {
+        let active = self.active;
+        // Every tab is pumped on every frame, shown or not, so several conversations run at
+        // once (D62). A tab that is not shown marks what it needs from the user.
+        for (index, live) in self.sessions.iter_mut().enumerate() {
             let events = live.session.pump();
             for e in &events {
                 live.transcript.fold(e, Some(clock));
@@ -367,9 +484,24 @@ impl app_t {
                 ) {
                     turn_ended = true;
                 }
+                if index != active {
+                    match e.event {
+                        SessionEvent::ApprovalRequested { .. }
+                        | SessionEvent::QuestionAsked { .. } => {
+                            live.attention = Attention::NeedsYou;
+                        }
+                        SessionEvent::TurnEnd { .. } if live.attention != Attention::NeedsYou => {
+                            live.attention = Attention::Finished;
+                        }
+                        _ => {}
+                    }
+                }
             }
             live.phase = live.session.phase();
             live.queued = live.session.queued();
+        }
+        if self.pump_closing() {
+            turn_ended = true;
         }
         if turn_ended {
             self.summaries_dirty = true;
@@ -394,7 +526,7 @@ impl app_t {
     }
 
     /// Reset the approval and question widgets when a new request appears.
-    fn sync_widgets(&mut self) {
+    pub(crate) fn sync_widgets(&mut self) {
         let (approval, question) = match self.active() {
             Some(s) => (
                 s.transcript
@@ -421,6 +553,12 @@ impl app_t {
         if self.help_open {
             return Modal::Help;
         }
+        if self.menu.is_some() {
+            return Modal::Menu;
+        }
+        if self.delete_plan.is_some() {
+            return Modal::Confirm;
+        }
         if let Some(m) = self.sidebar_modal() {
             return m;
         }
@@ -430,6 +568,10 @@ impl app_t {
     /// The approval or question waiting in the active session, whatever else is open. The dock
     /// shows its widget even while a sidebar prompt has the keys.
     pub fn pending_modal(&self) -> Modal {
+        // The conversation under the settings page waits in its tab; the page has the keys.
+        if self.page_shown {
+            return Modal::None;
+        }
         let Some(s) = self.active() else {
             return Modal::None;
         };
@@ -466,6 +608,11 @@ impl app_t {
             popup_open: !self.popup().is_empty(),
             answer_empty: self.answer.is_empty(),
             option_count,
+            page: self
+                .page
+                .as_ref()
+                .map(settings_page_t::keys)
+                .unwrap_or(PageKeys::Browse),
         }
     }
 
@@ -487,6 +634,11 @@ impl app_t {
                     return;
                 }
                 if let Some(action) = map_key(key, &self.key_ctx()) {
+                    if self.menu.is_some()
+                        && !matches!(action, Action::Menu(_) | Action::Escape | Action::Interrupt)
+                    {
+                        self.menu = None;
+                    }
                     self.apply(action);
                 }
             }
@@ -495,12 +647,30 @@ impl app_t {
                 if !self.options.mouse {
                     return;
                 }
-                let sidebar = if self.layout.sidebar_mode() == SidebarMode::Hidden {
-                    Rect::default()
-                } else {
-                    self.layout.sidebar
+                // A press outside the menu or the delete dialog closes it and does nothing else.
+                // A right press then opens the menu of what is under it.
+                if let MouseEventKind::Down(button) = mouse.kind
+                    && (self.menu.is_some() || self.delete_plan.is_some())
+                    && !self
+                        .overlay_areas
+                        .iter()
+                        .any(|r| r.contains(Position::new(mouse.column, mouse.row)))
+                {
+                    self.menu = None;
+                    self.delete_plan = None;
+                    if button != MouseButton::Right {
+                        return;
+                    }
+                }
+                let areas = wheel_areas_t {
+                    sidebar: if self.layout.sidebar_mode() == SidebarMode::Hidden {
+                        Rect::default()
+                    } else {
+                        self.layout.sidebar
+                    },
+                    tabs: self.layout.tabs,
                 };
-                match map_mouse(mouse, &self.hits, self.dragging, sidebar) {
+                match map_mouse(mouse, &self.hits, self.dragging, areas) {
                     MouseIntent::Act(action) => self.apply(action),
                     MouseIntent::StartDrag(action) => {
                         self.dragging = self.hits.at(mouse.column, mouse.row).map(|h| h.rect);
@@ -509,9 +679,13 @@ impl app_t {
                     MouseIntent::Drag(action) => self.apply(action),
                     MouseIntent::EndDrag => self.dragging = None,
                     MouseIntent::Hover(x, y) => self.hover = Some((x, y)),
-                    MouseIntent::Grab(index) => {
+                    MouseIntent::Grab(index, mods) => {
                         self.hover = Some((mouse.column, mouse.row));
-                        self.grab_row(index);
+                        self.grab_row(index, ClickKind::of(mods));
+                    }
+                    MouseIntent::Context(x, y) => {
+                        self.hover = Some((x, y));
+                        self.context_at(x, y);
                     }
                     MouseIntent::DragAt(x, y) => self.drag_to(x, y),
                     MouseIntent::Release(x, y) => self.release_at(x, y),
@@ -520,6 +694,10 @@ impl app_t {
             }
             Event::Paste(text) => {
                 self.pending_escape = None;
+                if self.focus == Focus::Settings {
+                    self.page_paste(text);
+                    return;
+                }
                 match self.modal() {
                     Modal::Question => {
                         self.answer.apply(EditOp::Paste(text.clone()));
@@ -557,7 +735,7 @@ impl app_t {
             }
         }
         self.size = (w, h);
-        if w < DockWidth {
+        if !self.can_dock() {
             self.drawer_open = self.drawer_open && self.focus == Focus::Sidebar;
             if self.sidebar_modal().is_some() {
                 // The prompt, confirmation or pick-up stays in view in the drawer.
@@ -572,7 +750,32 @@ impl app_t {
             self.help_open = false;
             return;
         }
+        if self.menu.is_some() {
+            self.menu_back();
+            return;
+        }
+        if self.delete_plan.take().is_some() {
+            return;
+        }
         if self.cancel_sidebar_modal() {
+            return;
+        }
+        if self.focus == Focus::Settings && self.page_escape() {
+            return;
+        }
+        if self.focus == Focus::Sidebar && self.clear_selection() {
+            self.rebuild_sidebar_items();
+            return;
+        }
+        if self.page_shown {
+            // The page is the view: esc closes the drawer over it, then the page, and never
+            // stops the turn of the conversation under it.
+            if self.drawer_open {
+                self.drawer_open = false;
+                self.focus = Focus::Settings;
+            } else {
+                self.close_page();
+            }
             return;
         }
         if self.busy() {
@@ -581,7 +784,7 @@ impl app_t {
         }
         if self.drawer_open {
             self.drawer_open = false;
-            self.focus = Focus::Input;
+            self.focus = self.main_focus();
             return;
         }
         if !self.popup().is_empty() {
@@ -629,6 +832,15 @@ impl app_t {
             Action::Submit => self.submit(),
             Action::Escape => self.pending_escape = Some(self.clock),
             Action::Interrupt => {
+                if self.menu.take().is_some() || self.delete_plan.take().is_some() {
+                    return;
+                }
+                if self.focus == Focus::Settings
+                    && let Some(page) = self.page.as_mut()
+                    && (page.prompt.take().is_some() || page.confirm.take().is_some())
+                {
+                    return;
+                }
                 if self.cancel_sidebar_modal() {
                     return;
                 }
@@ -667,9 +879,15 @@ impl app_t {
                 self.help_scroll = 0;
             }
             Action::ToggleAnimation => {
-                self.animate = !self.animate;
-                let state = if self.animate { "on" } else { "off" };
-                self.say(format!("generation effect {state}"), ToastKind::Info);
+                if !self.options.animate {
+                    self.say(
+                        "animation is off by the command line (--speed instant)",
+                        ToastKind::Info,
+                    );
+                } else if self.change_setting(|s| s.animation = !s.animation) {
+                    let state = if self.animate { "on" } else { "off" };
+                    self.say(format!("animation {state} (saved)"), ToastKind::Info);
+                }
             }
             Action::ClearQueue => {
                 if let Some(s) = self.active_mut() {
@@ -688,6 +906,12 @@ impl app_t {
                 if f != Focus::Sidebar {
                     self.cancel_sidebar_modal();
                 }
+                // While the page shows, the main panel is the page.
+                let f = match f {
+                    Focus::Input | Focus::Transcript if self.page_shown => Focus::Settings,
+                    Focus::Settings if !self.page_shown => Focus::Input,
+                    other => other,
+                };
                 self.focus = f;
                 if f == Focus::Transcript {
                     self.select_last_block();
@@ -696,12 +920,17 @@ impl app_t {
             Action::ScrollBy(d) => {
                 if self.help_open {
                     self.help_scroll = (self.help_scroll as i64 + i64::from(d)).max(0) as usize;
+                } else if self.page_shown {
+                    self.apply_page(crate::settings_page::PageAction::Scroll(d));
                 } else if let Some(s) = self.active_mut() {
                     s.scroll.scroll_by(i64::from(d));
                 }
             }
             Action::PageBy(d) => {
-                if let Some(s) = self.active_mut() {
+                if self.page_shown {
+                    let rows = i32::from(self.layout.transcript.height.saturating_sub(2).max(1));
+                    self.apply_page(crate::settings_page::PageAction::Scroll(rows * d));
+                } else if let Some(s) = self.active_mut() {
                     let page = s.scroll.viewport.saturating_sub(2).max(1) as i64;
                     s.scroll.scroll_by(page * i64::from(d));
                 }
@@ -762,15 +991,22 @@ impl app_t {
                 self.select_row(i);
                 self.apply(Action::NewSubfolder);
             }
-            Action::RenameFolder => self.start_rename(),
+            Action::RenameRow => self.start_rename(),
             Action::RenameFolderAt(i) => {
                 self.select_row(i);
                 self.start_rename();
             }
-            Action::DeleteFolder => self.start_delete(),
+            Action::DeleteRows => {
+                let targets = self.targets();
+                self.start_delete_rows(targets);
+            }
             Action::DeleteFolderAt(i) => {
                 self.select_row(i);
                 self.start_delete();
+            }
+            Action::TogglePin => {
+                let ids = crate::conversation::session_ids(&self.targets());
+                self.toggle_pin(&ids);
             }
             Action::PickUp => self.start_pickup(),
             Action::PickUpAt(i) => {
@@ -785,10 +1021,25 @@ impl app_t {
                 }
             }
             Action::PromptSubmit => self.prompt_submit(),
-            Action::ConfirmYes => self.confirm_delete(),
-            Action::SidebarCancel => {
-                self.cancel_sidebar_modal();
+            Action::ConfirmYes => {
+                if self.delete_plan.is_some() {
+                    self.confirm_delete_plan();
+                } else {
+                    self.confirm_delete();
+                }
             }
+            Action::SidebarCancel => {
+                if self.delete_plan.take().is_none() {
+                    self.cancel_sidebar_modal();
+                }
+            }
+            Action::Tab(tab) => self.apply_tab(tab),
+            Action::Select(select) => {
+                self.apply_select(select);
+                self.rebuild_sidebar_items();
+            }
+            Action::Menu(menu) => self.apply_menu(menu),
+            Action::Page(page) => self.apply_page(page),
             Action::Approve(decision) => self.approve(decision),
             Action::ApprovalMove(d) => {
                 self.approval_sel =
@@ -864,6 +1115,11 @@ impl app_t {
 
     fn cycle_focus(&mut self, d: i32) {
         self.cancel_sidebar_modal();
+        if self.page_shown {
+            // The page has its own panes; from the sidebar, tab goes back onto it.
+            self.focus_page_from_sidebar(d);
+            return;
+        }
         let sidebar_open = match self.layout.sidebar_mode() {
             SidebarMode::Hidden => false,
             SidebarMode::Docked | SidebarMode::Drawer => true,
@@ -921,20 +1177,39 @@ impl app_t {
         }
     }
 
+    /// The focus of the main panel: the page when it shows, else the input.
+    pub(crate) fn main_focus(&self) -> Focus {
+        if self.page_shown {
+            Focus::Settings
+        } else {
+            Focus::Input
+        }
+    }
+
+    /// True when the sidebar docks at the current width, by the `sidebar` and `sidebar_width`
+    /// settings (D63).
+    pub fn can_dock(&self) -> bool {
+        crate::layout::docks(
+            self.size.0,
+            self.settings.sidebar,
+            self.settings.sidebar_width,
+        )
+    }
+
     fn toggle_sidebar(&mut self) {
         self.cancel_sidebar_modal();
         self.grab = None;
-        if self.size.0 >= DockWidth {
+        if self.can_dock() {
             self.sidebar_pinned = !self.sidebar_pinned;
             if !self.sidebar_pinned && self.focus == Focus::Sidebar {
-                self.focus = Focus::Input;
+                self.focus = self.main_focus();
             }
         } else {
             self.drawer_open = !self.drawer_open;
             self.focus = if self.drawer_open {
                 Focus::Sidebar
             } else {
-                Focus::Input
+                self.main_focus()
             };
         }
     }
@@ -987,6 +1262,11 @@ impl app_t {
             }
             Command::New => self.new_chat(),
             Command::Sidebar => self.toggle_sidebar(),
+            Command::Approval(mode) if mode != ApprovalMode::Full => {
+                // The same path as the menu: saved for the conversation and applied now.
+                let ids = self.shown_ids();
+                self.set_approval(&ids, Some(mode));
+            }
             Command::Approval(mode) => {
                 let result = self.active_mut().map(|s| s.session.set_approval_mode(mode));
                 match result {
@@ -1001,9 +1281,41 @@ impl app_t {
             Command::ClearQueue => self.apply(Action::ClearQueue),
             Command::Copy => self.copy_reply(),
             Command::Animate => self.apply(Action::ToggleAnimation),
+            Command::Settings => self.open_page(None),
+            Command::Theme(arg) => self.theme_command(arg),
+            Command::ThemeImport(path) => {
+                self.import_theme(&path);
+            }
             Command::Folder(None) => self.start_create(None),
             Command::Folder(Some(name)) => {
                 self.create_folder_named(name, None);
+            }
+            Command::Tab => self.apply_tab(crate::input::TabAction::New),
+            Command::Close => self.apply_tab(crate::input::TabAction::CloseActive),
+            Command::Rename(title) => match self.active().map(|s| s.session.id().to_string()) {
+                Some(id) => match title {
+                    Some(title) => {
+                        self.rename_conversation(&id, title);
+                    }
+                    None => self.start_rename_session(&id),
+                },
+                None => self.say("no conversation is open", ToastKind::Info),
+            },
+            Command::Pin => {
+                let ids = self.shown_ids();
+                self.toggle_pin(&ids);
+            }
+            Command::Archive => {
+                let ids = self.shown_ids();
+                self.toggle_archived(&ids);
+            }
+            Command::Delete => {
+                let rows = self
+                    .shown_ids()
+                    .into_iter()
+                    .map(crate::selection::RowId::Session)
+                    .collect();
+                self.start_delete_rows(rows);
             }
             Command::Quit => self.quit = true,
         }
@@ -1020,63 +1332,6 @@ impl app_t {
         }
     }
 
-    pub fn new_chat(&mut self) {
-        match self.runtime.new_session() {
-            Ok(session) => {
-                let mut live = live_session_t::new(session);
-                live.logo_from = self.animate.then_some(self.clock);
-                self.sessions.push(live);
-                self.active = self.sessions.len() - 1;
-                self.focus = Focus::Input;
-                self.drawer_open = false;
-                self.summaries_dirty = true;
-                self.sync_widgets();
-                self.rebuild_sidebar_items();
-            }
-            Err(err) => self.say(
-                format!("could not start a session: {err}"),
-                ToastKind::Error,
-            ),
-        }
-    }
-
-    pub fn open_session(&mut self, id: &str) {
-        if let Some(i) = self.sessions.iter().position(|s| s.session.id() == id) {
-            self.active = i;
-        } else {
-            match self.runtime.open_session(id) {
-                Ok(opened) => {
-                    let mut live = live_session_t::new(opened.session);
-                    for e in &opened.events {
-                        live.transcript.fold(e, None);
-                    }
-                    live.phase = live.session.phase();
-                    self.sessions.push(live);
-                    self.active = self.sessions.len() - 1;
-                    if opened.skipped_lines > 0 {
-                        self.say(
-                            format!(
-                                "skipped {} unreadable line(s) of the saved session",
-                                opened.skipped_lines
-                            ),
-                            ToastKind::Warning,
-                        );
-                    }
-                }
-                Err(err) => {
-                    self.say(
-                        format!("could not open the session: {err}"),
-                        ToastKind::Error,
-                    );
-                    return;
-                }
-            }
-        }
-        self.drawer_open = false;
-        self.sync_widgets();
-        self.rebuild_sidebar_items();
-    }
-
     fn sidebar_activate(&mut self, index: usize) {
         let Some(item) = self.sidebar_items.get(index).cloned() else {
             return;
@@ -1090,7 +1345,9 @@ impl app_t {
                 }
                 self.rebuild_sidebar_items();
             }
-            SidebarItemKind::Session { id } => self.open_session(&id),
+            SidebarItemKind::Session { id } => {
+                self.open_conversation(&id, crate::tabs::OpenPlace::Setting)
+            }
         }
     }
 
@@ -1188,174 +1445,5 @@ impl app_t {
             SessionPhase::AwaitingAnswer => "waiting for your answer".to_string(),
             SessionPhase::Cancelling => "cancelling…".to_string(),
         }
-    }
-
-    /// The sidebar list: new chat, the "conversations" label, then the tree: folders sorted by
-    /// name with their sub-folders and conversations, then unfiled conversations, newest first
-    /// (D54). Rows carry their move marks while something moves (D55).
-    pub fn rebuild_sidebar_items(&mut self) {
-        struct entry_t {
-            id: String,
-            title: String,
-            updated: u64,
-            turns: u32,
-            demo: bool,
-            project: String,
-        }
-        let current_project = sanitize(&self.info.project, false);
-        let mut entries: Vec<entry_t> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for s in &self.summaries {
-            if !seen.insert(s.id.clone()) {
-                continue;
-            }
-            let title = if s.title.trim().is_empty() {
-                "New chat".to_string()
-            } else {
-                sanitize(&s.title, false)
-            };
-            entries.push(entry_t {
-                id: s.id.clone(),
-                title,
-                updated: s.updated_ms,
-                turns: s.turns,
-                demo: s.simulated,
-                project: sanitize(&s.project, false),
-            });
-        }
-        for live in &self.sessions {
-            let id = live.session.id().to_string();
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let project = live
-                .transcript
-                .meta
-                .as_ref()
-                .map(|m| sanitize(&m.project, false))
-                .unwrap_or_else(|| current_project.clone());
-            entries.push(entry_t {
-                id,
-                title: live.title(),
-                updated: if live.transcript.last_at_ms > 0 {
-                    live.transcript.last_at_ms
-                } else {
-                    self.now_ms
-                },
-                turns: live.transcript.turn.turn,
-                demo: self.info.identity.simulated(),
-                project,
-            });
-        }
-        entries.sort_by_key(|e| std::cmp::Reverse(e.updated));
-        let active_id = self.active().map(|s| s.session.id().to_string());
-        let activity_of = |id: &str| {
-            self.sessions
-                .iter()
-                .find(|s| s.session.id() == id)
-                .map(live_session_t::activity)
-                .unwrap_or(Activity::Idle)
-        };
-        // Conversations by folder. A conversation filed in a folder that does not exist is
-        // listed as unfiled (the organisation's rules make that impossible, D51).
-        let org = &self.organization;
-        let mut filed: BTreeMap<String, Vec<sidebar_item_t>> = BTreeMap::new();
-        let mut unfiled: Vec<sidebar_item_t> = Vec::new();
-        for e in entries {
-            let mut detail = format!("{} · {}t", format_age(self.now_ms, e.updated), e.turns);
-            if !e.project.is_empty() && e.project != current_project {
-                detail = format!("{} · {detail}", truncate(&e.project, 12));
-            }
-            let item = sidebar_item_t {
-                active: active_id.as_deref() == Some(e.id.as_str()),
-                detail,
-                activity: activity_of(&e.id),
-                kind: SidebarItemKind::Session { id: e.id.clone() },
-                title: e.title,
-                demo: e.demo,
-                depth: 0,
-                mark: MoveMark::None,
-            };
-            match org.folder_of(&e.id).filter(|f| org.folder(f).is_some()) {
-                Some(folder) => filed.entry(folder.to_string()).or_default().push(item),
-                None => unfiled.push(item),
-            }
-        }
-        let mut items = vec![
-            sidebar_item_t {
-                kind: SidebarItemKind::NewChat,
-                title: "New chat".to_string(),
-                detail: String::new(),
-                active: false,
-                activity: Activity::Idle,
-                demo: false,
-                depth: 0,
-                mark: MoveMark::None,
-            },
-            sidebar_item_t {
-                kind: SidebarItemKind::Root,
-                title: "conversations".to_string(),
-                detail: String::new(),
-                active: false,
-                activity: Activity::Idle,
-                demo: false,
-                depth: 0,
-                mark: MoveMark::None,
-            },
-        ];
-        fn walk(
-            org: &organization_t,
-            parent: Option<&str>,
-            depth: usize,
-            folded: &BTreeSet<String>,
-            filed: &BTreeMap<String, Vec<sidebar_item_t>>,
-            out: &mut Vec<sidebar_item_t>,
-        ) {
-            if depth > harness::organize::MaxFolderDepth {
-                return;
-            }
-            for folder in org.children(parent) {
-                let collapsed = folded.contains(&folder.id);
-                let inside: Vec<&sidebar_item_t> = filed
-                    .iter()
-                    .filter(|(f, _)| org.is_within(f, &folder.id))
-                    .flat_map(|(_, list)| list.iter())
-                    .collect();
-                let activity = if inside.iter().any(|i| i.activity == Activity::Waiting) {
-                    Activity::Waiting
-                } else if inside.iter().any(|i| i.activity == Activity::Generating) {
-                    Activity::Generating
-                } else {
-                    Activity::Idle
-                };
-                out.push(sidebar_item_t {
-                    kind: SidebarItemKind::Folder {
-                        id: folder.id.clone(),
-                        collapsed,
-                    },
-                    title: sanitize(&folder.name, false),
-                    detail: org.session_count(&folder.id).to_string(),
-                    active: false,
-                    activity,
-                    demo: false,
-                    depth,
-                    mark: MoveMark::None,
-                });
-                if collapsed {
-                    continue;
-                }
-                walk(org, Some(&folder.id), depth + 1, folded, filed, out);
-                for item in filed.get(&folder.id).into_iter().flatten() {
-                    let mut item = item.clone();
-                    item.depth = depth + 1;
-                    out.push(item);
-                }
-            }
-        }
-        walk(org, None, 0, &self.folded, &filed, &mut items);
-        items.extend(unfiled);
-        self.mark_moves(&mut items);
-        self.sidebar_sel = self.sidebar_sel.min(items.len().saturating_sub(1));
-        self.sidebar_items = items;
     }
 }

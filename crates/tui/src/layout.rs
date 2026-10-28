@@ -4,14 +4,45 @@
 //! Screen geometry as a pure function of the terminal size and the UI state. No drawing here;
 //! tests check the boundaries directly.
 
+use harness::settings::{SidebarVisibility, SidebarWidth};
 use ratatui::layout::Rect;
 
 pub const MinWidth: u16 = 40;
 pub const MinHeight: u16 = 12;
-/// Below this width the sidebar is not docked; it opens as a drawer over the transcript.
+/// Below this width the sidebar is not docked with `sidebar` set to auto; it opens as a drawer
+/// over the transcript (D48a).
 pub const DockWidth: u16 = 100;
-pub const SidebarWidth: u16 = 34;
-pub const WideSidebarWidth: u16 = 38;
+/// The sidebar's columns for each `sidebar_width` setting (D63).
+pub const CompactSidebarWidth: u16 = 28;
+pub const NormalSidebarWidth: u16 = 34;
+/// `normal` grows to this from `GrowWidth` columns (D48a).
+pub const GrownSidebarWidth: u16 = 38;
+pub const WideSidebarWidth: u16 = 42;
+pub const GrowWidth: u16 = 150;
+/// With `sidebar` pinned, the main panel keeps at least this many columns beside it.
+pub const PinnedMainWidth: u16 = 60;
+
+/// The sidebar's columns at terminal width `width`.
+pub fn sidebar_columns(width: u16, setting: SidebarWidth) -> u16 {
+    match setting {
+        SidebarWidth::Compact => CompactSidebarWidth,
+        SidebarWidth::Normal if width >= GrowWidth => GrownSidebarWidth,
+        SidebarWidth::Normal => NormalSidebarWidth,
+        SidebarWidth::Wide => WideSidebarWidth,
+    }
+}
+
+/// True when the sidebar may dock at terminal width `width` (D63): `auto` from `DockWidth`
+/// columns, `pinned` whenever the main panel keeps `PinnedMainWidth` columns, `hidden` never.
+pub fn docks(width: u16, visibility: SidebarVisibility, setting: SidebarWidth) -> bool {
+    match visibility {
+        SidebarVisibility::Auto => width >= DockWidth,
+        SidebarVisibility::Pinned => {
+            width >= sidebar_columns(width, setting).saturating_add(PinnedMainWidth)
+        }
+        SidebarVisibility::Hidden => false,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SidebarMode {
@@ -34,6 +65,9 @@ pub struct layout_input_t {
     /// Rows of the slash-command popup, 0 when closed.
     pub popup_rows: u16,
     pub help_open: bool,
+    /// The `sidebar` and `sidebar_width` settings (D63).
+    pub visibility: SidebarVisibility,
+    pub side_width: SidebarWidth,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,6 +75,9 @@ pub struct layout_t {
     pub too_small: bool,
     pub area: Rect,
     pub main: Rect,
+    /// The tab bar across the top of the main panel (D62). Empty when the screen is too short
+    /// to keep three transcript rows under it.
+    pub tabs: Rect,
     pub transcript: Rect,
     pub scrollbar: Rect,
     pub queue: Rect,
@@ -67,18 +104,14 @@ pub fn compute(input: layout_input_t) -> layout_t {
             ..layout_t::default()
         };
     }
-    let wide = input.width >= DockWidth;
+    let wide = docks(input.width, input.visibility, input.side_width);
+    let columns = sidebar_columns(input.width, input.side_width);
     let (mode, side_w) = if wide && input.sidebar_pinned {
-        let w = if input.width >= 150 {
-            WideSidebarWidth
-        } else {
-            SidebarWidth
-        };
-        (SidebarMode::Docked, w)
+        (SidebarMode::Docked, columns)
     } else if !wide && input.drawer_open {
         (
             SidebarMode::Drawer,
-            SidebarWidth.min(input.width.saturating_sub(6)),
+            columns.min(input.width.saturating_sub(6)),
         )
     } else {
         (SidebarMode::Hidden, 0)
@@ -99,10 +132,12 @@ pub fn compute(input: layout_input_t) -> layout_t {
     let dock_h = input.dock_rows.clamp(2, max_dock);
     let queue_h = input.queue_rows.min(2);
     let below = status_h + dock_h + queue_h;
-    let transcript_h = input.height.saturating_sub(below).max(3);
-    let transcript = Rect::new(main.x, 0, main.width, transcript_h);
-    let queue = Rect::new(main.x, transcript_h, main.width, queue_h);
-    let dock_y = transcript_h.saturating_add(queue_h);
+    let tabs_h = u16::from(input.height.saturating_sub(below) >= 4);
+    let transcript_h = input.height.saturating_sub(below + tabs_h).max(3);
+    let tabs = Rect::new(main.x, 0, main.width, tabs_h);
+    let transcript = Rect::new(main.x, tabs_h, main.width, transcript_h);
+    let queue = Rect::new(main.x, tabs_h + transcript_h, main.width, queue_h);
+    let dock_y = (tabs_h + transcript_h).saturating_add(queue_h);
     let dock = Rect::new(main.x, dock_y, main.width, dock_h);
     let status = Rect::new(
         main.x,
@@ -139,6 +174,7 @@ pub fn compute(input: layout_input_t) -> layout_t {
         too_small: false,
         area,
         main,
+        tabs,
         transcript,
         scrollbar,
         queue,
@@ -165,6 +201,8 @@ mod tests {
             queue_rows: 0,
             popup_rows: 0,
             help_open: false,
+            visibility: SidebarVisibility::Auto,
+            side_width: SidebarWidth::Normal,
         }
     }
 
@@ -232,6 +270,7 @@ mod tests {
                     let l = compute(i);
                     for r in [
                         l.main,
+                        l.tabs,
                         l.transcript,
                         l.queue,
                         l.dock,
@@ -244,11 +283,79 @@ mod tests {
                         assert!(inside(r, l.area), "{r:?} in {:?}", l.area);
                     }
                     assert!(l.transcript.height >= 3);
+                    assert!(l.tabs.height == 0 || l.tabs.bottom() == l.transcript.y);
                     assert_eq!(l.status.bottom(), h);
                     assert!(l.dock.bottom() <= l.status.y);
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_tab_bar_sits_above_the_transcript_and_gives_way_when_short() {
+        let l = compute(input(120, 40));
+        assert_eq!(l.tabs, Rect::new(0, 0, l.main.width, 1));
+        assert_eq!(l.transcript.y, 1);
+        let mut tight = input(40, 12);
+        tight.dock_rows = 200;
+        tight.queue_rows = 2;
+        let l = compute(tight);
+        assert_eq!(l.tabs.height, 0, "three transcript rows win over the bar");
+        assert_eq!(l.transcript.y, 0);
+    }
+
+    #[test]
+    fn the_sidebar_settings_change_the_docking_rule_and_the_width() {
+        let at = |w: u16, v, sw| {
+            let mut i = input(w, 30);
+            i.visibility = v;
+            i.side_width = sw;
+            compute(i)
+        };
+        use SidebarVisibility::{Auto, Hidden, Pinned};
+        // Auto: today's rule, 34 columns, 38 from 150.
+        assert_eq!(
+            at(99, Auto, SidebarWidth::Normal).sidebar_mode(),
+            SidebarMode::Hidden
+        );
+        assert_eq!(at(100, Auto, SidebarWidth::Normal).sidebar.width, 34);
+        assert_eq!(at(150, Auto, SidebarWidth::Normal).sidebar.width, 38);
+        // Only normal grows.
+        assert_eq!(at(150, Auto, SidebarWidth::Compact).sidebar.width, 28);
+        assert_eq!(at(150, Auto, SidebarWidth::Wide).sidebar.width, 42);
+        // Pinned docks whenever 60 columns stay for the main panel.
+        assert_eq!(
+            at(88, Pinned, SidebarWidth::Compact).sidebar_mode(),
+            SidebarMode::Docked
+        );
+        assert_eq!(
+            at(87, Pinned, SidebarWidth::Compact).sidebar_mode(),
+            SidebarMode::Hidden
+        );
+        assert_eq!(
+            at(94, Pinned, SidebarWidth::Normal).sidebar_mode(),
+            SidebarMode::Docked
+        );
+        assert_eq!(
+            at(101, Pinned, SidebarWidth::Wide).sidebar_mode(),
+            SidebarMode::Hidden
+        );
+        assert_eq!(
+            at(102, Pinned, SidebarWidth::Wide).sidebar_mode(),
+            SidebarMode::Docked
+        );
+        // Hidden never docks; the drawer still opens, in the chosen width.
+        assert_eq!(
+            at(200, Hidden, SidebarWidth::Normal).sidebar_mode(),
+            SidebarMode::Hidden
+        );
+        let mut i = input(200, 30);
+        i.visibility = Hidden;
+        i.side_width = SidebarWidth::Wide;
+        i.drawer_open = true;
+        let l = compute(i);
+        assert_eq!(l.sidebar_mode(), SidebarMode::Drawer);
+        assert_eq!((l.sidebar.width, l.main.width), (42, 200));
     }
 
     #[test]

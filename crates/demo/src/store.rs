@@ -135,6 +135,19 @@ impl session_store_t for file_store_t {
         file.flush().map_err(|err| io_error(&path, err))?;
         Ok(())
     }
+
+    /// Removes only the session's own file. The id is checked first, so the path is always
+    /// `<dir>/sessions/<id>.jsonl`.
+    fn delete(&self, id: &str) -> Result<(), StoreError> {
+        let path = self.session_path(id)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                Err(StoreError::NotFound { id: id.to_string() })
+            }
+            Err(err) => Err(io_error(&path, err)),
+        }
+    }
 }
 
 /// Parses a session file. Blank lines are ignored. Any other line that is too long, is not
@@ -357,6 +370,56 @@ mod tests {
         assert_eq!(summaries[0].updated_ms, 250);
         assert_eq!(summaries[0].title, "hi");
         assert!(summaries[0].simulated);
+    }
+
+    #[test]
+    fn a_deleted_session_is_not_found_and_leaves_the_list() {
+        let scratch = scratch_dir_t::new("delete");
+        let store = file_store_t::new(scratch.path.clone());
+        ok(store.append("keep", &start("keep", 1)));
+        ok(store.append("gone", &start("gone", 2)));
+        ok(store.delete("gone"));
+
+        assert!(matches!(
+            store.load("gone"),
+            Err(StoreError::NotFound { .. })
+        ));
+        let ids: Vec<String> = ok(store.list()).into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["keep"]);
+        assert!(!scratch.path.join("sessions").join("gone.jsonl").exists());
+        assert!(matches!(
+            store.delete("gone"),
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn delete_refuses_path_like_ids_and_touches_nothing_outside_the_sessions_dir() {
+        let scratch = scratch_dir_t::new("delete-traversal");
+        let store = file_store_t::new(scratch.path.clone());
+        ok(store.append("keep", &start("keep", 1)));
+        // A file next to the sessions directory must survive a delete aimed at it.
+        let outside = scratch.path.join("outside.jsonl");
+        ok(fs::write(&outside, "not a session"));
+
+        for bad in ["../outside", "a/b", "..", ""] {
+            assert!(
+                matches!(store.delete(bad), Err(StoreError::InvalidId { .. })),
+                "delete {bad:?}"
+            );
+        }
+        assert!(outside.exists());
+        assert_eq!(ok(store.load("keep")).events.len(), 1);
+    }
+
+    #[test]
+    fn delete_of_a_session_whose_file_is_a_directory_is_an_io_error() {
+        let scratch = scratch_dir_t::new("delete-dir");
+        let store = file_store_t::new(scratch.path.clone());
+        let dir = scratch.path.join("sessions");
+        ok(fs::create_dir_all(dir.join("odd.jsonl")));
+        assert!(matches!(store.delete("odd"), Err(StoreError::Io { .. })));
+        assert!(dir.join("odd.jsonl").is_dir());
     }
 
     #[test]

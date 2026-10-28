@@ -14,6 +14,7 @@ pub mod organize;
 pub mod paths;
 pub mod profile;
 pub mod scenario;
+pub mod settings;
 pub mod store;
 pub mod timing;
 pub mod tools;

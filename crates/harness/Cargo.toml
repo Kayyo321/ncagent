@@ -1,0 +1,14 @@
+[package]
+name = "harness"
+description = "Sessions, event log, packing, reply protocol, tools and approvals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ncm = { path = "../ncm" }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0.154"

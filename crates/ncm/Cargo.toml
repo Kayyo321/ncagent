@@ -1,0 +1,10 @@
+[package]
+name = "ncm"
+description = "NCM export reader, kernels, tokenizers, generator, pick and sampling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }

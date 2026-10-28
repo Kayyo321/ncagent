@@ -1,0 +1,23 @@
+[package]
+name = "tui"
+description = "ratatui front end: layout, mouse, approval and question widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+harness = { path = "../harness" }
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+pulldown-cmark = "0.13.5"
+unicode-width = "0.2.2"
+
+[features]
+# Compiles the scripted UI preview fixture (`tui::scripted`) for the gallery example. The
+# shipped binary does not enable it.
+preview = []
+
+[[example]]
+name = "gallery"
+required-features = ["preview"]

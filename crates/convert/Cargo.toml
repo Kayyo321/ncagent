@@ -1,0 +1,10 @@
+[package]
+name = "convert"
+description = "Released-checkpoint converter and the inert unpickler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+ncm = { path = "../ncm" }

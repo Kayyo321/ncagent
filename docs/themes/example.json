@@ -1,0 +1,13 @@
+{
+  "name": "Deep sea",
+  "id": "deep-sea",
+  "extends": "navy",
+  "colors": {
+    "bg": "#04121a",
+    "fg": "#d8ecf2",
+    "agent": "#5fd3e0",
+    "tool": "#e58fd6",
+    "approval": "#f2b45a",
+    "success": "#6fdba0"
+  }
+}

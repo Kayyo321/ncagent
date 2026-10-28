@@ -759,7 +759,8 @@ impl app_t {
         if self.prompt.is_some() || self.confirm.is_some() {
             self.cancel_sidebar_modal();
         }
-        let source = if self.pickup.is_some() {
+        // Only a plain press can start a move: a modified press changes the selection.
+        let source = if self.pickup.is_some() || click != ClickKind::Plain {
             None
         } else {
             match self.row_id(index) {

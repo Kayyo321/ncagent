@@ -11,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::app::{ToastKind, app_t};
+use crate::app::app_t;
 use crate::banner::chip;
 use crate::canvas::{fill, put_line, put_str, put_str_right, tint};
 use crate::help::help_lines;
@@ -333,7 +333,7 @@ pub fn draw(app: &mut app_t, frame: &mut Frame<'_>) {
             lay.sidebar_mode() == SidebarMode::Drawer,
         );
     }
-    draw_toast(app, buf, lay.transcript);
+    crate::toast::draw_toast(app, buf, lay.transcript);
     if app.help_open {
         draw_help(app, buf, lay.help);
     }
@@ -1206,39 +1206,6 @@ fn draw_side(app: &mut app_t, buf: &mut Buffer, area: Rect, drawer: bool) {
         // A tone edge where the drawer meets the transcript.
         tint(buf, Rect::new(area.x, area.y, 1, area.height), theme.inset);
     }
-}
-
-fn draw_toast(app: &mut app_t, buf: &mut Buffer, area: Rect) {
-    let theme = &app.theme;
-    let Some(t) = &app.toast else {
-        return;
-    };
-    let color = match t.kind {
-        ToastKind::Info => theme.agent,
-        ToastKind::Warning => theme.approval,
-        ToastKind::Error => theme.error,
-    };
-    let max = usize::from(area.width.saturating_sub(8)).max(8);
-    let text = format!(" {} ", truncate(&t.text, max));
-    let w = str_width(&text) as u16 + 1;
-    let x = area.right().saturating_sub(w + 2);
-    let y = area.y;
-    put_str(
-        buf,
-        x,
-        y,
-        area.right(),
-        "▌",
-        Style::new().fg(color).bg(theme.inset),
-    );
-    put_str(
-        buf,
-        x.saturating_add(1),
-        y,
-        area.right(),
-        &text,
-        Style::new().fg(theme.fg).bg(theme.inset),
-    );
 }
 
 fn draw_help(app: &mut app_t, buf: &mut Buffer, area: Rect) {

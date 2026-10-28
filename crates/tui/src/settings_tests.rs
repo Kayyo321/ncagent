@@ -925,6 +925,7 @@ fn a_refused_save_is_a_toast_and_the_value_stays() {
     r.key(KeyCode::Right, KeyModifiers::NONE);
     assert_eq!(r.app.settings.density, Density::Comfortable);
     assert!(toast(&r).contains("disk full"), "{}", toast(&r));
+    r.advance(crate::toast::MaxToastFxMs);
     assert!(r.screen().contains("disk full"));
     r.rt.fail_settings(None);
     r.key(KeyCode::Right, KeyModifiers::NONE);

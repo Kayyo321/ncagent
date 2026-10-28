@@ -775,6 +775,19 @@ pub fn draw_sidebar(
         if input.selected_count > 1 && y < footer_y.saturating_sub(2) {
             draw_selection_line(buf, &ctx, y, hits);
             y = y.saturating_add(1);
+            if y < footer_y.saturating_sub(4) {
+                // Many terminals take shift+click for their own selection: say how else.
+                let hint = [
+                    "drag ☐ for a range · shift+click may be taken by your terminal",
+                    "drag ☐ over rows for a range",
+                    "drag ☐ for a range",
+                ]
+                .into_iter()
+                .find(|h| str_width(h) <= inner)
+                .unwrap_or("");
+                put_str(buf, x0, y, x1, hint, base.fg(theme.fg_faint));
+                y = y.saturating_add(1);
+            }
         }
         let overlay = input
             .overlay
@@ -1272,6 +1285,28 @@ fn draw_tree_row(
             }
             right_start = cx;
         }
+    } else if input.chips && !moving && input.selected_count > 0 {
+        // While a selection shows, every row offers its selection chip, dim, so a range can be
+        // painted from any of them (see `select_paint`).
+        let cx = x1.saturating_sub(3);
+        if cx >= x0.saturating_add((item.depth * 2 + 6) as u16) {
+            let chip_rect = Rect::new(cx, y, 3, 1);
+            let (glyph, fg) = if item.selected {
+                (CheckOn, theme.ice)
+            } else {
+                (CheckOff, theme.fg_faint)
+            };
+            put_str(
+                buf,
+                cx,
+                y,
+                x1,
+                &format!(" {glyph} "),
+                Style::new().fg(fg).bg(mix(row_bg, theme.inset, 0.5)),
+            );
+            hits.add(chip_rect, Action::Select(SelectAction::ToggleAt(index)));
+            right_start = cx.saturating_sub(1);
+        }
     }
     let pulse = if input.animate {
         (input.clock as f32 / 300.0).sin() * 0.5 + 0.5
@@ -1304,7 +1339,9 @@ fn draw_tree_row(
                 Some(folder_right(item, hot, collapsed, theme, pulse))
             };
             let right_w = right.as_ref().map(|r| r.width() as u16).unwrap_or(0);
-            let end = right_start.min(x1.saturating_sub(right_w + u16::from(right_w > 0)));
+            let end = right_start
+                .min(x1)
+                .saturating_sub(right_w + u16::from(right_w > 0));
             let name = truncate(&item.title, end.saturating_sub(nx) as usize);
             put_str(
                 buf,
@@ -1315,7 +1352,8 @@ fn draw_tree_row(
                 st.fg(name_fg).add_modifier(Modifier::BOLD),
             );
             if let Some(r) = right {
-                put_line(buf, x1.saturating_sub(right_w).max(nx), y, x1, &r, st);
+                let edge = right_start.min(x1);
+                put_line(buf, edge.saturating_sub(right_w).max(nx), y, edge, &r, st);
             }
         }
         SidebarItemKind::Session { .. } => {

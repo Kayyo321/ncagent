@@ -78,9 +78,12 @@ pub fn run_loop(runtime: Arc<dyn runtime_t>, options: app_options_t) -> Result<(
                 backend.flush().map_err(io_error)?;
             }
             if app.quit {
+                // Empty conversations still open are deleted, not left as empty logs.
+                app.shutdown();
                 return Ok(());
             }
-            let animating = app.busy()
+            let animating = app.toast_animating()
+                || app.busy()
                 || app.sessions.iter().any(|s| s.busy())
                 || app.active().is_some_and(|s| s.view.any_live(&s.transcript));
             let wait = if animating { BusyTick } else { IdleTick };

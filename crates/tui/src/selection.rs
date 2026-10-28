@@ -8,7 +8,16 @@
 //! toggles a row, `shift`+click selects the visible range from the anchor, and `ctrl`+`shift`
 //! adds that range. The keys do the same from the keyboard cursor. The keyboard cursor
 //! (`sidebar_sel`) is apart from the selection: it moves with `j` and `k` and leaves the
-//! selection as it is.
+//! selected rows as they are.
+//!
+//! The anchor of a range is, in order: the anchor set by the last plain click, ctrl+click,
+//! chip, cursor move or opened conversation; else the cursor row; else the row of the open
+//! conversation; else the clicked row itself. An anchor that left the list (deleted, or hidden
+//! in a folded folder) falls through to the next one.
+//!
+//! Many terminals keep shift+click (and some ctrl+click) for their own text selection while
+//! the mouse is reported, so the app never sees it. A range also needs no modifier: press on a
+//! row's `☐` chip and drag over the other rows to paint the range (see `select_paint`).
 
 use std::collections::BTreeSet;
 
@@ -144,6 +153,41 @@ impl selection_t {
         self.explicit = true;
     }
 
+    /// Make `id` the anchor of the next range, keeping the selected rows.
+    pub fn set_anchor(&mut self, id: RowId) {
+        self.anchor = Some(id);
+    }
+
+    /// Select (or, with `off`, unselect) the rows of `order` from `from` to `to`, inclusive,
+    /// on top of `base`, and make `from` the anchor. A row id not in `order` changes nothing.
+    pub fn paint(
+        &mut self,
+        base: &selection_t,
+        order: &[RowId],
+        from: &RowId,
+        to: &RowId,
+        off: bool,
+    ) {
+        let (Some(a), Some(b)) = (
+            order.iter().position(|id| id == from),
+            order.iter().position(|id| id == to),
+        ) else {
+            return;
+        };
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let mut ids = base.ids.clone();
+        for id in order.iter().take(hi + 1).skip(lo) {
+            if off {
+                ids.remove(id);
+            } else {
+                ids.insert(id.clone());
+            }
+        }
+        self.ids = ids;
+        self.anchor = Some(from.clone());
+        self.explicit = !self.ids.is_empty();
+    }
+
     /// Select every row of `order`. The anchor stays.
     pub fn all(&mut self, order: &[RowId]) {
         self.ids = order.iter().cloned().collect();
@@ -220,6 +264,51 @@ impl app_t {
         self.row_id(self.sidebar_sel).into_iter().collect()
     }
 
+    /// The row a range starts from (see the module note), given the clicked row.
+    pub fn range_anchor(&self, clicked: &RowId) -> RowId {
+        let order = self.visible_rows();
+        let listed = |id: &RowId| order.contains(id);
+        self.selection
+            .anchor()
+            .filter(|a| listed(a))
+            .cloned()
+            .or_else(|| self.row_id(self.sidebar_sel).filter(listed))
+            .or_else(|| {
+                self.active()
+                    .map(|s| RowId::Session(s.session.id().to_string()))
+                    .filter(listed)
+            })
+            .unwrap_or_else(|| clicked.clone())
+    }
+
+    /// While no selection shows, the anchor follows the open conversation, so a later
+    /// shift+click ranges from it. A plain click's row stays selected (a ctrl+click adds to it)
+    /// only while it is the open conversation.
+    pub(crate) fn anchor_on_shown(&mut self) {
+        if self.selection.shown() {
+            return;
+        }
+        let Some(id) = self
+            .active()
+            .map(|s| RowId::Session(s.session.id().to_string()))
+        else {
+            return;
+        };
+        if !self.selection.contains(&id) {
+            self.selection.clear();
+        }
+        self.selection.set_anchor(id);
+    }
+
+    /// A plain cursor move (`j`, `k`) while no selection shows: the anchor follows the cursor.
+    pub(crate) fn anchor_on_cursor(&mut self) {
+        if !self.selection.shown()
+            && let Some(id) = self.row_id(self.sidebar_sel)
+        {
+            self.selection.set_anchor(id);
+        }
+    }
+
     /// A click on row `index` with `kind`. A plain click selects the row and opens it (or folds
     /// a folder); the others change the selection and open nothing.
     pub fn click_row(&mut self, index: usize, kind: ClickKind) {
@@ -229,6 +318,11 @@ impl app_t {
             }
             return;
         };
+        if matches!(kind, ClickKind::Range | ClickKind::AddRange) {
+            // Before the cursor moves to the clicked row, which is a fallback anchor itself.
+            let anchor = self.range_anchor(&id);
+            self.selection.set_anchor(anchor);
+        }
         self.sidebar_sel = index;
         self.focus = Focus::Sidebar;
         let order = self.visible_rows();
@@ -245,8 +339,11 @@ impl app_t {
 
     /// `shift`+`↑`/`↓`, `J`, `K`: move the cursor and select from the anchor to it.
     pub fn select_extend(&mut self, d: i32) {
-        if self.selection.anchor().is_none() || self.selection.is_empty() {
-            match self.row_id(self.sidebar_sel) {
+        if self.selection.is_empty() || !self.selection.shown() {
+            // The keys start at the cursor row: for them the cursor is where the user is. A
+            // cursor move already made it the anchor (`anchor_on_cursor`).
+            let start = self.row_id(self.sidebar_sel);
+            match start {
                 Some(id) => self.selection.only(id, true),
                 None => self.selection.clear(),
             }
@@ -344,6 +441,33 @@ mod tests {
         assert_eq!(sel.anchor(), Some(&s("c")));
         sel.range(&order(), &s("zzz"), false);
         assert_eq!(sel.len(), 1, "an id not in the order changes nothing");
+    }
+
+    #[test]
+    fn painting_a_range_adds_or_removes_it_on_top_of_the_base() {
+        let order = order();
+        let mut base = selection_t::default();
+        base.toggle(s("a"));
+        let mut sel = base.clone();
+        sel.paint(&base, &order, &s("b"), &s("d"), false);
+        assert_eq!(sel.in_order(&order), vec![s("a"), s("b"), s("c"), s("d")]);
+        assert_eq!(sel.anchor(), Some(&s("b")));
+        // Up from b, over the folder.
+        sel.paint(&base, &order, &s("b"), &RowId::Folder("f1".into()), false);
+        assert_eq!(
+            sel.in_order(&order),
+            vec![RowId::Folder("f1".into()), s("a"), s("b")]
+        );
+        // Off: from a selected row the range is removed.
+        let mut all = selection_t::default();
+        all.all(&order);
+        sel.paint(&all, &order, &s("c"), &s("a"), true);
+        assert_eq!(
+            sel.in_order(&order),
+            vec![RowId::Folder("f1".into()), s("d")]
+        );
+        sel.paint(&all, &order, &s("c"), &s("zz"), true);
+        assert_eq!(sel.len(), 2, "a row not listed changes nothing");
     }
 
     #[test]

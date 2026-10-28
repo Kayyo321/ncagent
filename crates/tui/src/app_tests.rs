@@ -1354,6 +1354,8 @@ pub(crate) fn keyboard_path(target: &Target) -> bool {
                 | Action::Select(_)
                 | Action::Menu(_)
                 | Action::Page(_)
+                // A toast goes on its own after its time; a click only ends it sooner.
+                | Action::DismissToast
         ),
     }
 }
@@ -1513,6 +1515,8 @@ fn approval_full_is_refused_with_its_message() {
         rig.calls(),
         vec![ScriptCall::SetApprovalMode(ApprovalMode::Full)]
     );
+    // The toast has revealed.
+    rig.advance(crate::toast::MaxToastFxMs);
     assert!(
         rig.screen()
             .contains("must be selected on the command line"),
@@ -1547,6 +1551,7 @@ fn quitting() {
     let mut rig = rig_t::new(100, 30, true);
     rig.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert!(!rig.app.quit);
+    rig.advance(crate::toast::MaxToastFxMs);
     assert!(rig.screen().contains("press ctrl+c again to quit"));
     rig.key(KeyCode::Char('c'), KeyModifiers::CONTROL);
     assert!(rig.app.quit);

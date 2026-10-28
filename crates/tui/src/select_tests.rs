@@ -594,7 +594,8 @@ fn delete_asks_then_removes_the_logs_and_closes_the_tabs() {
     assert!(screen.contains("saved logs permanently"), "{screen}");
     assert!(screen.contains("enter delete"), "{screen}");
     rig.key(KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(rig.rt.deleted(), ["s-b", "s-c"]);
+    // The unused first New chat was deleted when a conversation replaced its tab.
+    assert_eq!(rig.rt.deleted(), ["preview-1", "s-b", "s-c"]);
     assert!(!rig.rt.is_stored("s-b") && !rig.rt.is_stored("s-c"));
     assert!(rig.app.tab_of("s-b").is_none(), "its tab closed");
     assert_eq!(toast(&rig), "2 deleted");
@@ -619,7 +620,8 @@ fn delete_skips_a_running_conversation_and_says_so() {
     rig.ch('d');
     assert!(rig.screen().contains("still running and will be skipped"));
     rig.click_action(&Action::ConfirmYes);
-    assert_eq!(rig.rt.deleted(), ["s-e"]);
+    // The unused first New chat was deleted when a conversation replaced its tab.
+    assert_eq!(rig.rt.deleted(), ["preview-1", "s-e"]);
     assert_eq!(toast(&rig), "1 deleted · 1 skipped: still running");
     // Only running ones: refused at once.
     rig.select_by_keys(row(&rig, "s-a"));
@@ -702,7 +704,8 @@ fn slash_commands_act_on_the_open_conversation() {
         rig.screen()
     );
     rig.key(KeyCode::Char('y'), KeyModifiers::NONE);
-    assert_eq!(rig.rt.deleted(), ["s-d"]);
+    // The unused first New chat was deleted when a conversation replaced its tab.
+    assert_eq!(rig.rt.deleted(), ["preview-1", "s-d"]);
     assert!(rig.app.tab_of("s-d").is_none());
     assert!(!rig.app.sessions.is_empty(), "there is always a tab");
 }

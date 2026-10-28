@@ -143,11 +143,11 @@ pub const Mouse: &[(&str, &str)] = &[
     ),
     (
         "shift+click",
-        "select from the anchor to the row; ctrl+shift adds the range",
+        "range from the anchor (your terminal may keep it; drag ☐ instead)",
     ),
     (
         "☐ chip",
-        "on hover: add or remove the row from the selection",
+        "add or remove the row; drag it over rows to select (or clear) a range",
     ),
     ("right click", "a row, a selection or a tab: its menu"),
     (

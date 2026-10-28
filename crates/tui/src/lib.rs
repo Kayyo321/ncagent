@@ -34,6 +34,7 @@ pub mod layout;
 pub mod markdown;
 pub mod menu;
 pub mod menu_draw;
+pub mod select_paint;
 pub mod selection;
 pub mod settings;
 pub mod settings_draw;
@@ -50,6 +51,7 @@ pub mod text;
 pub mod theme;
 pub mod theme_actions;
 pub mod theme_set;
+pub mod toast;
 pub mod transcript;
 pub mod view_model;
 
@@ -59,7 +61,11 @@ pub mod scripted;
 #[cfg(test)]
 mod app_tests;
 #[cfg(test)]
+mod empty_tab_tests;
+#[cfg(test)]
 mod folder_tests;
+#[cfg(test)]
+mod range_tests;
 #[cfg(test)]
 mod select_tests;
 #[cfg(test)]
@@ -68,6 +74,8 @@ mod settings_tests;
 mod tab_tests;
 #[cfg(test)]
 mod theme_tests;
+#[cfg(test)]
+mod toast_tests;
 
 pub use theme::ColorMode;
 

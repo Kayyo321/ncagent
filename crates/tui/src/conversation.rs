@@ -333,7 +333,8 @@ impl app_t {
                 continue;
             }
             if let Some(i) = self.tab_of(id) {
-                self.close_tab(i);
+                // Deleted just below, so closing the tab does not delete it as well.
+                self.close_tab_with(i, false);
             }
             match self.runtime.delete_session(id) {
                 Ok(org) => {

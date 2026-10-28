@@ -174,6 +174,9 @@ pub enum Action {
     RunCommand(&'static str),
     /// The settings page (D65).
     Page(PageAction),
+    /// Mouse only: a click on the toast starts its dissolve. Keys: none needed, a toast goes on
+    /// its own after its time.
+    DismissToast,
 }
 
 /// Which widget owns the keyboard.
@@ -552,6 +555,8 @@ pub enum MouseIntent {
     Grab(usize, KeyModifiers),
     /// A right press: the app opens the menu of whatever is under the pointer (D61).
     Context(u16, u16),
+    /// A press on the selection chip of sidebar row `n`: a drag from it paints a range.
+    Paint(usize),
     /// The pointer moved with the button held, outside a scrollbar drag.
     DragAt(u16, u16),
     /// The button went up, outside a scrollbar drag.
@@ -579,6 +584,10 @@ pub fn map_mouse(
                 rect,
                 target: Target::Scrollbar,
             }) => MouseIntent::StartDrag(scrollbar_action(*rect, y)),
+            Some(hit_t {
+                target: Target::Action(Action::Select(SelectAction::ToggleAt(index))),
+                ..
+            }) => MouseIntent::Paint(*index),
             Some(hit_t {
                 target: Target::Action(action),
                 ..

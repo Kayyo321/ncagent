@@ -619,7 +619,62 @@ pub fn render_reveal(
     now: u64,
     theme: &theme_t,
 ) -> effect_frame_t {
-    if now >= start_ms.saturating_add(RevealMs) {
+    render_reveal_timed(
+        final_lines,
+        coarse_cols,
+        seed,
+        start_ms,
+        now,
+        reveal_timing_t::title(),
+        theme,
+    )
+}
+
+/// How long a reveal takes: in all, per cell from blocks to glyph, and the largest per-cell
+/// delay of the front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct reveal_timing_t {
+    pub total_ms: u64,
+    pub fade_ms: u64,
+    pub jitter_ms: u64,
+}
+
+impl reveal_timing_t {
+    /// The title card's reveal (D56).
+    pub fn title() -> Self {
+        reveal_timing_t {
+            total_ms: RevealMs,
+            fade_ms: RevealFadeMs,
+            jitter_ms: RevealJitterMs,
+        }
+    }
+
+    /// A reveal of `total_ms` with the title's proportions: a quarter of it for each cell's
+    /// fade and a tenth for the jitter of the front.
+    pub fn scaled(total_ms: u64) -> Self {
+        let total_ms = total_ms.max(10);
+        reveal_timing_t {
+            total_ms,
+            fade_ms: (total_ms * RevealFadeMs / RevealMs).max(1),
+            jitter_ms: (total_ms * RevealJitterMs / RevealMs).max(1),
+        }
+    }
+}
+
+/// `render_reveal` with its own timing.
+pub fn render_reveal_timed(
+    final_lines: &[line_t],
+    coarse_cols: usize,
+    seed: u64,
+    start_ms: u64,
+    now: u64,
+    timing: reveal_timing_t,
+    theme: &theme_t,
+) -> effect_frame_t {
+    let reveal_ms = timing.total_ms;
+    let fade_ms = timing.fade_ms.max(1);
+    let jitter_ms = timing.jitter_ms.max(1);
+    if now >= start_ms.saturating_add(reveal_ms) {
         return effect_frame_t {
             lines: final_lines.to_vec(),
             done: true,
@@ -673,7 +728,7 @@ pub fn render_reveal(
             }
         }
     }
-    let front_ms = RevealMs - RevealFadeMs - RevealJitterMs;
+    let front_ms = reveal_ms.saturating_sub(fade_ms + jitter_ms).max(1);
     let level_ms = (front_ms / u64::from(RevealLevels)).max(1);
     let mut lines = Vec::with_capacity(rows);
     for row in 0..rows {
@@ -683,7 +738,7 @@ pub fn render_reveal(
         while col < cols {
             let fcell = target_row.and_then(|r| r.get(col));
             let u = front_position(row, col, rows, cols);
-            let jitter = hash(&[seed, row as u64, col as u64, 0x4C]) % RevealJitterMs;
+            let jitter = hash(&[seed, row as u64, col as u64, 0x4C]) % jitter_ms;
             let reveal = start_ms
                 .saturating_add((u * front_ms as f32) as u64)
                 .saturating_add(jitter);
@@ -720,7 +775,7 @@ pub fn render_reveal(
                 col += 1;
                 continue;
             }
-            let p = (now - reveal) as f32 / RevealFadeMs as f32;
+            let p = (now - reveal) as f32 / fade_ms as f32;
             let h = hash(&[seed, row as u64, col as u64, now / 60]);
             col += fade_cell(&mut line, fcell, p, h, theme);
         }

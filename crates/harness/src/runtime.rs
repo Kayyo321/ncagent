@@ -360,7 +360,7 @@ mod tests {
         let backend = Arc::new(fake_backend_t::new(vec![plan]));
         let store = Arc::new(memory_store_t::new());
         let runtime = runtime_with(
-            backend,
+            Arc::clone(&backend),
             Arc::new(fake_tools_t::new(false)),
             Arc::clone(&store),
             test_config(ApprovalMode::Ask),
@@ -368,6 +368,17 @@ mod tests {
         let id = {
             let mut session = runtime.new_session().expect("a session");
             session.submit("interrupted".to_string());
+            // Drop the session only once its worker has taken the blocking plan. Otherwise the
+            // plan can still be queued when the reopened session submits, and that call blocks
+            // with nobody to cancel it.
+            let started = std::time::Instant::now();
+            while backend.seen().is_empty() {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "the worker never started the call"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             session.id().to_string()
         };
         let opened = runtime.open_session(&id).expect("the session opens");

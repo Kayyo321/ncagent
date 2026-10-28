@@ -14,6 +14,10 @@
 //!
 //! With `restore_tabs` the open tabs and the shown one are saved through the runtime whenever
 //! they change, and reopened at the next start (D63).
+//!
+//! A tab that is discarded while its conversation is empty deletes that conversation, so unused
+//! "New chat" logs do not pile up (see `discard_if_empty`). This covers closing a tab, replacing
+//! an unused tab with another conversation, and quitting.
 
 use std::collections::HashSet;
 
@@ -183,7 +187,9 @@ impl app_t {
         });
         match self.sessions.get_mut(self.active) {
             Some(slot) if reuse => {
-                *slot = live;
+                let old = std::mem::replace(slot, live);
+                // `reuse` needs an empty composer, which is the old tab's draft.
+                self.discard_if_empty(old, true);
                 self.sync_widgets();
                 self.rebuild_sidebar_items();
                 self.tabs_changed();
@@ -195,6 +201,12 @@ impl app_t {
     /// Close tab `index`. A busy tab is cancelled first and named in a toast. The last tab is
     /// replaced by a New chat, so there is always one; a lone unused New chat stays.
     pub fn close_tab(&mut self, index: usize) {
+        self.close_tab_with(index, true);
+    }
+
+    /// Close tab `index`. With `discard` an empty conversation is deleted with it; the delete
+    /// command closes its tabs without, because it deletes them itself.
+    pub(crate) fn close_tab_with(&mut self, index: usize, discard: bool) {
         if index >= self.sessions.len() {
             return;
         }
@@ -203,6 +215,11 @@ impl app_t {
             return;
         }
         let was_active = index == self.active;
+        let draft_empty = if was_active {
+            self.composer.is_empty()
+        } else {
+            self.sessions.get(index).is_none_or(|s| s.draft.is_empty())
+        };
         if was_active {
             // The closed tab's draft goes with it.
             self.composer = composer_t::new();
@@ -214,6 +231,8 @@ impl app_t {
             live.phase = live.session.phase();
             self.closing.push(live);
             self.say(format!("stopped “{title}”"), ToastKind::Info);
+        } else if discard {
+            self.discard_if_empty(live, draft_empty);
         }
         if self.sessions.is_empty() {
             self.active = 0;
@@ -274,6 +293,76 @@ impl app_t {
         }
     }
 
+    /// True when a conversation leaving its tab is empty, so nothing is lost by deleting it:
+    /// - `untouched`: no user message, nothing queued, and not busy;
+    /// - no turn was ever started in it;
+    /// - its draft is empty (`draft_empty`: the composer for the shown tab, the saved draft for
+    ///   a tab in the background);
+    /// - it has no settings of its own (no title, pin, colour tag, archive or approval mode,
+    ///   D57) and is not filed in a folder (D50), in the organisation as last read;
+    /// - it is not open in another tab and not still stopping after a close.
+    pub fn is_empty_conversation(&self, live: &live_session_t, draft_empty: bool) -> bool {
+        let id = live.session.id();
+        draft_empty
+            && live.untouched()
+            && live.transcript.turn.turn == 0
+            && self.organization.meta(id).is_default()
+            && self.organization.folder_of(id).is_none()
+            && self.tab_of(id).is_none()
+            && !self.closing.iter().any(|c| c.session.id() == id)
+    }
+
+    /// Drop a conversation that left its tab, deleting it through the runtime when it is empty
+    /// (see `is_empty_conversation`). No confirmation and no toast on success: there is nothing
+    /// to lose, and `confirm_delete` does not apply. A failed delete is one error toast; the tab
+    /// is gone either way. The sidebar loses the row at once.
+    pub(crate) fn discard_if_empty(&mut self, live: live_session_t, draft_empty: bool) {
+        if !self.is_empty_conversation(&live, draft_empty) {
+            return;
+        }
+        let id = live.session.id().to_string();
+        drop(live);
+        match self.runtime.delete_session(&id) {
+            Ok(org) => self.organization = org,
+            Err(err) => self.say(
+                format!("could not delete the empty conversation: {err}"),
+                ToastKind::Error,
+            ),
+        }
+        // The cached list must not bring the row back before the next read.
+        self.summaries.retain(|s| s.id != id);
+        self.rebuild_sidebar_items();
+    }
+
+    /// At quit: delete the empty conversations still open in tabs (see `discard_if_empty`) and
+    /// save the tabs that are left, so the saved tab list never names a deleted conversation.
+    pub fn shutdown(&mut self) {
+        let shown = self.active().map(|s| s.session.id().to_string());
+        let mut index = 0;
+        while index < self.sessions.len() {
+            let draft_empty = if index == self.active {
+                self.composer.is_empty()
+            } else {
+                self.sessions.get(index).is_none_or(|s| s.draft.is_empty())
+            };
+            let live = self.sessions.remove(index);
+            // Out of the tab list for the check, so its own tab does not count as another one.
+            if self.is_empty_conversation(&live, draft_empty) {
+                if index < self.active {
+                    self.active -= 1;
+                }
+                self.discard_if_empty(live, draft_empty);
+            } else {
+                self.sessions.insert(index, live);
+                index += 1;
+            }
+        }
+        self.active = shown
+            .and_then(|id| self.tab_of(&id))
+            .unwrap_or(self.sessions.len().saturating_sub(1));
+        self.tabs_changed();
+    }
+
     /// Pump the tabs that were closed while running until they stop, then drop them. True when
     /// one of them ended its turn.
     pub(crate) fn pump_closing(&mut self) -> bool {
@@ -293,6 +382,7 @@ impl app_t {
     /// Save the open tabs and the shown one when `restore_tabs` is on and they changed. At most
     /// `MaxSavedTabs` are kept, around the shown tab.
     pub(crate) fn tabs_changed(&mut self) {
+        self.anchor_on_shown();
         if !self.settings.restore_tabs {
             return;
         }

@@ -43,7 +43,6 @@ pub const EscapeDelayMs: u64 = 70;
 pub const QuitArmMs: u64 = 2000;
 /// The session list is read again at most this often, and after each turn ends.
 pub const SummaryRefreshMs: u64 = 5000;
-const ToastMs: u64 = 3200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct app_options_t {
@@ -59,10 +58,18 @@ pub enum ToastKind {
     Error,
 }
 
+/// A toast card (see `toast` for its reveal and dissolve).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct toast_t {
     pub text: String,
     pub kind: ToastKind,
+    /// App-clock time it was shown.
+    pub shown: u64,
+    /// Length of its reveal, and of its dissolve at the end. 0 when animation is off.
+    pub in_ms: u64,
+    pub out_ms: u64,
+    /// The end of its readable time: the reveal plus `ToastMs`, or a dismissal. The dissolve
+    /// runs from here for `out_ms`.
     pub until: u64,
 }
 
@@ -282,6 +289,8 @@ pub struct app_t {
     pub pickup: Option<MoveSource>,
     /// A sidebar row held by the mouse.
     pub grab: Option<grab_t>,
+    /// A range being painted by dragging from a row's selection chip.
+    pub paint: Option<crate::select_paint::paint_t>,
     pub help_open: bool,
     pub help_scroll: usize,
     /// The settings page, while it is open (D65).
@@ -361,6 +370,7 @@ impl app_t {
             overlay_areas: Vec::new(),
             pickup: None,
             grab: None,
+            paint: None,
             help_open: false,
             help_scroll: 0,
             page: None,
@@ -431,11 +441,12 @@ impl app_t {
     }
 
     pub fn say(&mut self, text: impl Into<String>, kind: ToastKind) {
-        self.toast = Some(toast_t {
-            text: text.into(),
+        self.toast = Some(crate::toast::new_toast(
+            text.into(),
             kind,
-            until: self.clock.saturating_add(ToastMs),
-        });
+            self.clock,
+            self.animate,
+        ));
     }
 
     /// A toast that keeps the one showing, for messages at start that come one after another.
@@ -519,7 +530,7 @@ impl app_t {
         if self.quit_armed_until.is_some_and(|t| clock > t) {
             self.quit_armed_until = None;
         }
-        if self.toast.as_ref().is_some_and(|t| clock > t.until) {
+        if self.toast.as_ref().is_some_and(|t| clock > t.gone()) {
             self.toast = None;
         }
         self.rebuild_sidebar_items();
@@ -632,6 +643,9 @@ impl app_t {
                     // delayed Escape, so this one acts at once.
                     self.cancel_drag();
                     return;
+                } else if self.paint.is_some() {
+                    self.cancel_paint();
+                    return;
                 }
                 if let Some(action) = map_key(key, &self.key_ctx()) {
                     if self.menu.is_some()
@@ -686,6 +700,17 @@ impl app_t {
                     MouseIntent::Context(x, y) => {
                         self.hover = Some((x, y));
                         self.context_at(x, y);
+                    }
+                    MouseIntent::Paint(index) => {
+                        self.hover = Some((mouse.column, mouse.row));
+                        self.start_paint(index);
+                    }
+                    MouseIntent::DragAt(x, y) if self.paint.is_some() => self.paint_to(x, y),
+                    MouseIntent::Release(x, y) if self.paint.is_some() => {
+                        if self.paint.as_ref().is_some_and(|p| p.moved) {
+                            self.paint_to(x, y);
+                        }
+                        self.end_paint();
                     }
                     MouseIntent::DragAt(x, y) => self.drag_to(x, y),
                     MouseIntent::Release(x, y) => self.release_at(x, y),
@@ -971,7 +996,10 @@ impl app_t {
                     s.transcript.toggle_expanded(id);
                 }
             }
-            Action::SidebarMove(d) => self.sidebar_step(d),
+            Action::SidebarMove(d) => {
+                self.sidebar_step(d);
+                self.anchor_on_cursor();
+            }
             Action::SidebarActivate => self.sidebar_activate(self.sidebar_sel),
             Action::SidebarActivateAt(i) => {
                 self.focus = Focus::Sidebar;
@@ -1040,6 +1068,7 @@ impl app_t {
             }
             Action::Menu(menu) => self.apply_menu(menu),
             Action::Page(page) => self.apply_page(page),
+            Action::DismissToast => self.dismiss_toast(),
             Action::Approve(decision) => self.approve(decision),
             Action::ApprovalMove(d) => {
                 self.approval_sel =

@@ -237,10 +237,12 @@ pub(crate) fn draw_toast(app: &mut app_t, buf: &mut Buffer, area: Rect) {
         ToastFrame::Card => {
             put_line(buf, x, y, area.right(), &card, Style::new());
             app.hits.add(Rect::new(x, y, w, 1), Action::DismissToast);
+            app.covers.push(Rect::new(x, y, w, 1));
         }
         ToastFrame::Effect(line) => {
             put_effect_line(buf, x, y, area.right(), &line);
             app.hits.add(Rect::new(x, y, w, 1), Action::DismissToast);
+            app.covers.push(Rect::new(x, y, w, 1));
         }
     }
 }

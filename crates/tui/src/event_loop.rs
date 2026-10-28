@@ -46,10 +46,15 @@ fn full_redraw<W: Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> io::Re
     terminal.resize(Rect::new(0, 0, size.width, size.height))
 }
 
-pub fn run_loop(runtime: Arc<dyn runtime_t>, options: app_options_t) -> Result<(), TuiError> {
+pub fn run_loop(
+    runtime: Arc<dyn runtime_t>,
+    options: app_options_t,
+    opener: Arc<dyn crate::opener::link_opener_t>,
+) -> Result<(), TuiError> {
     let start = Instant::now();
     let mut app = app_t::new(runtime, options.clone(), 0, wall_ms())
         .map_err(|e| TuiError::Session(e.message))?;
+    app.opener = opener;
     let guard = terminal_guard_t::enter(crossterm_control_t {
         mouse: options.mouse,
     })
@@ -65,11 +70,19 @@ pub fn run_loop(runtime: Arc<dyn runtime_t>, options: app_options_t) -> Result<(
             app.tick(clock, wall_ms());
             if app.redraw {
                 app.redraw = false;
+                app.link_overlay.reset();
                 full_redraw(&mut terminal).map_err(io_error)?;
             }
-            terminal
+            let completed = terminal
                 .draw(|frame| draw(&mut app, frame))
                 .map_err(io_error)?;
+            // Links become terminal hyperlinks over the frame just written (D77).
+            let links = app.link_bytes(completed.buffer);
+            if !links.is_empty() {
+                let backend = terminal.backend_mut();
+                backend.write_all(&links).map_err(io_error)?;
+                backend.flush().map_err(io_error)?;
+            }
             if !app.outputs.is_empty() {
                 let backend = terminal.backend_mut();
                 for bytes in app.outputs.drain(..) {

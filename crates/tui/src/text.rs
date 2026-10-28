@@ -17,6 +17,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub struct span_t {
     pub text: String,
     pub style: Style,
+    /// The address this text links to (D77). Only an address that passed
+    /// `links::safe_url` is ever stored here.
+    pub link: Option<String>,
 }
 
 impl span_t {
@@ -24,6 +27,7 @@ impl span_t {
         span_t {
             text: text.into(),
             style,
+            link: None,
         }
     }
 }
@@ -63,17 +67,26 @@ impl line_t {
     }
 
     pub fn push(&mut self, text: impl Into<String>, style: Style) {
+        self.push_linked(text, style, None);
+    }
+
+    /// `push` for text that may link somewhere. A run joins the one before it only when both
+    /// the style and the link are the same.
+    pub fn push_linked(&mut self, text: impl Into<String>, style: Style, link: Option<&str>) {
         let text = text.into();
         if text.is_empty() {
             return;
         }
         if let Some(last) = self.spans.last_mut()
             && last.style == style
+            && last.link.as_deref() == link
         {
             last.text.push_str(&text);
             return;
         }
-        self.spans.push(span_t::new(text, style));
+        let mut span = span_t::new(text, style);
+        span.link = link.map(str::to_string);
+        self.spans.push(span);
     }
 }
 
@@ -234,7 +247,7 @@ impl wrap_state_t<'_> {
 
     fn put_pending(&mut self) {
         for s in std::mem::take(&mut self.pending) {
-            self.cur.push(s.text, s.style);
+            self.cur.push_linked(s.text, s.style, s.link.as_deref());
         }
         self.cur_w += self.pending_w;
         self.pending_w = 0;
@@ -273,21 +286,24 @@ pub fn wrap_spans(
                     if !st.has_content {
                         continue;
                     }
-                    st.pending.push(span_t::new(s, span.style));
+                    let mut space = span_t::new(s, span.style);
+                    space.link = span.link.clone();
+                    st.pending.push(space);
                     st.pending_w += str_width(s);
                 }
                 piece_t::Word(s) => {
                     let w = str_width(s);
+                    let link = span.link.as_deref();
                     if st.cur_w + st.pending_w + w <= width {
                         st.put_pending();
-                        st.cur.push(s, span.style);
+                        st.cur.push_linked(s, span.style, link);
                         st.cur_w += w;
                         st.has_content = true;
                         continue;
                     }
                     if st.has_content && prefix_rest + w <= width {
                         st.flush();
-                        st.cur.push(s, span.style);
+                        st.cur.push_linked(s, span.style, link);
                         st.cur_w += w;
                         st.has_content = true;
                         continue;
@@ -302,7 +318,8 @@ pub fn wrap_spans(
                         if st.has_content && st.cur_w + c.width > width {
                             st.flush();
                         }
-                        st.cur.push(s.get(c.start..c.end).unwrap_or(""), span.style);
+                        st.cur
+                            .push_linked(s.get(c.start..c.end).unwrap_or(""), span.style, link);
                         st.cur_w += c.width;
                         st.has_content = true;
                     }

@@ -12,8 +12,8 @@ use crossterm::event::{Event, KeyCode, KeyModifiers, MouseEventKind};
 use harness::api::SessionError;
 use harness::approval::ApprovalMode;
 use harness::settings::{
-    ConversationOrder, Density, OpenIn, SettingsError, SidebarVisibility, SidebarWidth,
-    ToolResultView, custom_theme_t, settings_t,
+    ConversationOrder, Density, LinkAddresses, OpenIn, SettingsError, SidebarVisibility,
+    SidebarWidth, ToolResultView, custom_theme_t, settings_t,
 };
 use ratatui::layout::Rect;
 use ratatui::style::Color;
@@ -1264,4 +1264,92 @@ fn the_about_section_shows_the_facts_and_the_demo_notice() {
     }
     let notice = r.app.info.notice.clone().unwrap_or_default();
     assert!(screen.contains(&notice[..notice.len().min(20)]));
+}
+
+// Links (D78).
+
+#[test]
+fn the_link_rows_render_in_appearance_after_tool_results_at_every_width() {
+    for width in [130u16, 80, 50, 40] {
+        let mut r = rig(width, 60);
+        ctrl(&mut r, 'o');
+        r.app.apply(page(PageAction::Section(Section::Appearance)));
+        r.frame();
+        let screen = r.screen();
+        for needle in ["terminal hyperlinks", "link addresses", "hidden", "inline"] {
+            assert!(screen.contains(needle), "{width} {needle}\n{screen}");
+        }
+        let at = |label: &str| {
+            screen
+                .find(label)
+                .unwrap_or_else(|| panic!("{width}: no {label}\n{screen}"))
+        };
+        assert!(at("tool results") < at("terminal hyperlinks"), "{width}");
+        assert!(at("terminal hyperlinks") < at("link addresses"), "{width}");
+    }
+}
+
+#[test]
+fn the_link_settings_change_by_key_and_mouse_reset_and_count_in_about() {
+    let mut r = rig(130, 60);
+    at_setting(&mut r, SettingKey::LinkAddresses);
+    r.key(KeyCode::Right, KeyModifiers::NONE);
+    assert_eq!(r.app.settings.link_addresses, LinkAddresses::Inline);
+    let row = setting_row(&r, SettingKey::LinkAddresses);
+    assert!(
+        r.app.hits.find(&page(PageAction::Reset(row))).is_some(),
+        "a changed value offers reset"
+    );
+    r.click_action(&page(PageAction::Pick(row, 0)));
+    assert_eq!(r.app.settings.link_addresses, LinkAddresses::Hidden);
+    assert!(
+        r.app.hits.find(&page(PageAction::Reset(row))).is_none(),
+        "no chip at the default"
+    );
+    let row = setting_row(&r, SettingKey::LinkHyperlinks);
+    r.click_action(&page(PageAction::Toggle(row)));
+    assert!(!r.app.settings.link_hyperlinks);
+    r.click_action(&page(PageAction::Reset(row)));
+    assert!(r.app.settings.link_hyperlinks, "reset brings it back");
+    r.click_action(&page(PageAction::Toggle(row)));
+    r.app.apply(page(PageAction::Section(Section::About)));
+    r.frame();
+    assert!(r.screen().contains("1 setting(s) differ"), "{}", r.screen());
+    open_at(&mut r, Section::Appearance);
+    let row = setting_row(&r, SettingKey::LinkHyperlinks);
+    r.click_action(&page(PageAction::Reset(row)));
+    assert!(r.app.settings.link_hyperlinks);
+}
+
+#[test]
+fn reset_all_puts_both_link_settings_back() {
+    let mut r = rig(130, 60);
+    r.app.change_setting(|s| {
+        s.link_hyperlinks = false;
+        s.link_addresses = LinkAddresses::Inline;
+    });
+    open_at(&mut r, Section::About);
+    assert!(r.screen().contains("2 setting(s) differ"), "{}", r.screen());
+    let reset = row_index(&r, &PageRow::ResetAll);
+    r.click_action(&page(PageAction::Press(reset)));
+    r.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(r.app.settings.link_hyperlinks);
+    assert_eq!(r.app.settings.link_addresses, LinkAddresses::Hidden);
+    let s = saved_settings(&r);
+    assert!(s.link_hyperlinks);
+    assert_eq!(s.link_addresses, LinkAddresses::Hidden);
+}
+
+#[test]
+fn a_refused_link_save_from_the_page_is_a_toast_and_the_value_stays() {
+    let mut r = rig(130, 40);
+    at_setting(&mut r, SettingKey::LinkHyperlinks);
+    r.rt.fail_settings(Some(SessionError::Settings(SettingsError::Io {
+        path: "/x/settings.json".into(),
+        message: "disk full".into(),
+    })));
+    r.key(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(r.app.settings.link_hyperlinks, "the value stays");
+    assert!(toast(&r).contains("disk full"), "{}", toast(&r));
+    r.rt.fail_settings(None);
 }

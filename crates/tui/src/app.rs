@@ -295,6 +295,18 @@ pub struct app_t {
     pub help_scroll: usize,
     /// The settings page, while it is open (D65).
     pub page: Option<settings_page_t>,
+    /// The links drawn in the last frame (D77), and what covered the transcript.
+    pub links: Vec<crate::hyperlink::link_rect_t>,
+    pub covers: Vec<Rect>,
+    /// The keyboard's chosen link in navigate mode: (block id, link index).
+    pub link_cursor: Option<(u64, usize)>,
+    /// The address waiting in the open-link confirmation (D76).
+    pub link_dialog: Option<String>,
+    /// What the hyperlink overlay wrote last.
+    pub link_overlay: crate::hyperlink::link_overlay_t,
+    /// What opens a confirmed link. `tui::run` sets the system opener; tests keep the
+    /// recording one, which starts nothing.
+    pub opener: Arc<dyn crate::opener::link_opener_t>,
     /// The page is the view of the main panel. It can be open and hidden behind a tab.
     pub page_shown: bool,
     pub approval_sel: usize,
@@ -375,6 +387,12 @@ impl app_t {
             help_scroll: 0,
             page: None,
             page_shown: false,
+            links: Vec::new(),
+            covers: Vec::new(),
+            link_cursor: None,
+            link_dialog: None,
+            link_overlay: crate::hyperlink::link_overlay_t::default(),
+            opener: Arc::new(crate::opener::recording_opener_t::default()),
             approval_sel: 0,
             approval_for: None,
             question_sel: 0,
@@ -564,6 +582,9 @@ impl app_t {
         if self.help_open {
             return Modal::Help;
         }
+        if self.link_dialog.is_some() {
+            return Modal::Link;
+        }
         if self.menu.is_some() {
             return Modal::Menu;
         }
@@ -664,7 +685,9 @@ impl app_t {
                 // A press outside the menu or the delete dialog closes it and does nothing else.
                 // A right press then opens the menu of what is under it.
                 if let MouseEventKind::Down(button) = mouse.kind
-                    && (self.menu.is_some() || self.delete_plan.is_some())
+                    && (self.menu.is_some()
+                        || self.delete_plan.is_some()
+                        || self.link_dialog.is_some())
                     && !self
                         .overlay_areas
                         .iter()
@@ -672,6 +695,7 @@ impl app_t {
                 {
                     self.menu = None;
                     self.delete_plan = None;
+                    self.link_dialog = None;
                     if button != MouseButton::Right {
                         return;
                     }
@@ -775,6 +799,9 @@ impl app_t {
             self.help_open = false;
             return;
         }
+        if self.link_dialog.take().is_some() {
+            return;
+        }
         if self.menu.is_some() {
             self.menu_back();
             return;
@@ -857,7 +884,10 @@ impl app_t {
             Action::Submit => self.submit(),
             Action::Escape => self.pending_escape = Some(self.clock),
             Action::Interrupt => {
-                if self.menu.take().is_some() || self.delete_plan.take().is_some() {
+                if self.menu.take().is_some()
+                    || self.delete_plan.take().is_some()
+                    || self.link_dialog.take().is_some()
+                {
                     return;
                 }
                 if self.focus == Focus::Settings
@@ -975,12 +1005,19 @@ impl app_t {
                     s.scroll.to_track(offset, track);
                 }
             }
-            Action::SelectBlock(d) => self.select_block(d),
+            Action::SelectBlock(d) => {
+                self.link_cursor = None;
+                self.select_block(d);
+            }
             Action::SelectBlockId(id) => {
+                self.link_cursor = None;
                 self.focus = Focus::Transcript;
                 if let Some(s) = self.active_mut() {
                     s.selected_block = Some(id);
                 }
+            }
+            Action::ToggleSelected if self.active_link().is_some() => {
+                self.apply_link(crate::link_ui::LinkAction::OpenActive);
             }
             Action::ToggleSelected => {
                 if let Some(s) = self.active_mut()
@@ -1069,6 +1106,7 @@ impl app_t {
             Action::Menu(menu) => self.apply_menu(menu),
             Action::Page(page) => self.apply_page(page),
             Action::DismissToast => self.dismiss_toast(),
+            Action::Link(link) => self.apply_link(link),
             Action::Approve(decision) => self.approve(decision),
             Action::ApprovalMove(d) => {
                 self.approval_sel =
@@ -1311,6 +1349,7 @@ impl app_t {
             Command::Copy => self.copy_reply(),
             Command::Animate => self.apply(Action::ToggleAnimation),
             Command::Settings => self.open_page(None),
+            Command::Links(switch) => self.links_command(switch),
             Command::Theme(arg) => self.theme_command(arg),
             Command::ThemeImport(path) => {
                 self.import_theme(&path);

@@ -12,7 +12,7 @@ pub struct command_t {
     pub about: &'static str,
 }
 
-pub const Commands: [command_t; 18] = [
+pub const Commands: [command_t; 19] = [
     command_t {
         name: "/help",
         args: "",
@@ -57,6 +57,11 @@ pub const Commands: [command_t; 18] = [
         name: "/settings",
         args: "",
         about: "open the settings page",
+    },
+    command_t {
+        name: "/links",
+        args: "[osc8|off|inline|hidden]",
+        about: "links as terminal hyperlinks or not; addresses shown or hidden (saved in the settings)",
     },
     command_t {
         name: "/theme",
@@ -116,6 +121,8 @@ pub enum Command {
     Copy,
     Animate,
     Settings,
+    /// `/links osc8|off|inline|hidden`; with no argument, the report of both settings.
+    Links(Option<crate::link_ui::LinksSwitch>),
     /// `/theme`: no argument opens the theme list, else the theme to apply (an id or a name).
     Theme(Option<String>),
     /// `/theme import <path>`: the path as typed, spaces included.
@@ -157,6 +164,14 @@ pub fn parse(text: &str) -> Option<Result<Command, String>> {
         "/copy" => simple(Command::Copy),
         "/animate" => simple(Command::Animate),
         "/settings" => simple(Command::Settings),
+        "/links" => match (arg, extra) {
+            (None, _) => Ok(Command::Links(None)),
+            (Some("osc8"), None) => Ok(Command::Links(Some(crate::link_ui::LinksSwitch::Osc8))),
+            (Some("off"), None) => Ok(Command::Links(Some(crate::link_ui::LinksSwitch::Off))),
+            (Some("inline"), None) => Ok(Command::Links(Some(crate::link_ui::LinksSwitch::Inline))),
+            (Some("hidden"), None) => Ok(Command::Links(Some(crate::link_ui::LinksSwitch::Hidden))),
+            _ => Err("usage: /links [osc8|off|inline|hidden]".to_string()),
+        },
         "/theme" => {
             let rest = text.get(name.len()..).unwrap_or("").trim();
             match rest.split_once(char::is_whitespace) {

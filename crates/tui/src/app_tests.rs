@@ -1085,6 +1085,52 @@ fn keyboard_parity_table() {
             observe: |r| format!("{:?} {:?}", r.rt.deleted(), r.app.delete_plan),
         },
         case_t {
+            name: "link text / navigate ] enter",
+            setup: |r| {
+                r.push(crate::link_tests::reply(&crate::link_tests::two_links()));
+                r.advance(10_000);
+            },
+            mouse: |r| {
+                r.click_action(&Action::Link(crate::link_ui::LinkAction::Choose(
+                    crate::link_tests::Paper.into(),
+                )))
+            },
+            keys: |r| {
+                let block = r
+                    .app
+                    .active()
+                    .and_then(|s| {
+                        s.transcript
+                            .blocks
+                            .iter()
+                            .rev()
+                            .find(|b| matches!(b.kind, crate::view_model::BlockKind::Reply(_)))
+                            .map(|b| b.id)
+                    })
+                    .unwrap_or(u64::MAX);
+                r.app.apply(Action::SetFocus(Focus::Transcript));
+                r.app.apply(Action::SelectBlockId(block));
+                r.frame();
+                r.ch(']');
+                r.key(KeyCode::Enter, KeyModifiers::NONE);
+            },
+            observe: |r| format!("{:?}", r.app.link_dialog),
+        },
+        case_t {
+            name: "link dialog chips / enter c esc",
+            setup: |r| {
+                r.push(crate::link_tests::reply(&crate::link_tests::two_links()));
+                r.advance(10_000);
+                r.app.apply(Action::Link(crate::link_ui::LinkAction::Choose(
+                    crate::link_tests::Paper.into(),
+                )));
+                r.frame();
+            },
+            mouse: |r| r.click_action(&Action::Link(crate::link_ui::LinkAction::Copy)),
+            keys: |r| r.ch('c'),
+            observe: |r| format!("{:?} {}", r.app.link_dialog, r.app.outputs.len()),
+        },
+        case_t {
             name: "settings button / ctrl+o",
             setup: noop,
             mouse: |r| r.click_action(&Action::Page(PageAction::Open)),
@@ -1356,6 +1402,8 @@ pub(crate) fn keyboard_path(target: &Target) -> bool {
                 | Action::Page(_)
                 // A toast goes on its own after its time; a click only ends it sooner.
                 | Action::DismissToast
+                // Links: navigate mode, `[` `]` to the link, `enter`; the dialog's keys.
+                | Action::Link(_)
         ),
     }
 }

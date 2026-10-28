@@ -355,8 +355,10 @@ impl app_t {
     /// the change is now in effect.
     pub fn change_setting(&mut self, change: impl FnOnce(&mut settings_t)) -> bool {
         let tabs_were_kept = self.settings.restore_tabs;
+        let links_were_on = self.settings.link_hyperlinks;
         let ok = self.update_settings(change);
         self.settings_changed();
+        self.links_changed(links_were_on);
         if ok && self.settings.restore_tabs && !tabs_were_kept {
             // Keep the tabs open now, not only after the next change of tabs.
             self.tabs_changed();

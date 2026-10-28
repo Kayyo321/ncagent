@@ -29,11 +29,15 @@ pub mod effect;
 pub mod event_loop;
 pub mod folders;
 pub mod help;
+pub mod hyperlink;
 pub mod input;
 pub mod layout;
+pub mod link_ui;
+pub mod links;
 pub mod markdown;
 pub mod menu;
 pub mod menu_draw;
+pub mod opener;
 pub mod select_paint;
 pub mod selection;
 pub mod settings;
@@ -64,6 +68,8 @@ mod app_tests;
 mod empty_tab_tests;
 #[cfg(test)]
 mod folder_tests;
+#[cfg(test)]
+mod link_tests;
 #[cfg(test)]
 mod range_tests;
 #[cfg(test)]
@@ -136,5 +142,6 @@ pub fn run(runtime: Arc<dyn runtime_t>, options: tui_options_t) -> Result<(), Tu
         mouse: options.mouse,
         color: options.color.unwrap_or_else(theme::detect_color_mode),
     };
-    event_loop::run_loop(runtime, app_options)
+    // The one place the real URL opener is used (D76).
+    event_loop::run_loop(runtime, app_options, Arc::new(opener::system_opener_t))
 }

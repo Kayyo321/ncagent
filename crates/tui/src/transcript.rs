@@ -67,6 +67,8 @@ pub struct render_ctx_t<'a> {
     pub tools_open: bool,
     /// Blank rows after each block: `BlockGap`, or 0 with the compact density (D63).
     pub gap: usize,
+    /// Every accepted link keeps its address after the label (the `link_addresses` setting, D78).
+    pub show_addresses: bool,
 }
 
 /// Seed of the logo reveal's textures, so every launch draws the same frames.
@@ -468,7 +470,7 @@ fn reply_rows(
             } else if e.display.trim().is_empty() {
                 Vec::new()
             } else {
-                markdown::render(&e.display, w, theme)
+                markdown::render_with(&e.display, w, theme, ctx.show_addresses)
             }
         });
         let stopped = a.stop.is_some() && a.end.is_none();
@@ -892,6 +894,7 @@ struct cached_t {
     revision: u64,
     animate: bool,
     tools_open: bool,
+    show_addresses: bool,
     rows: block_rows_t,
 }
 
@@ -916,6 +919,7 @@ impl transcript_view_t {
                 && c.revision == block.revision
                 && c.animate == ctx.animate
                 && c.tools_open == ctx.tools_open
+                && c.show_addresses == ctx.show_addresses
                 && !c.rows.live
                 && !matches!(block.kind, BlockKind::Banner));
             if !reuse {
@@ -928,6 +932,7 @@ impl transcript_view_t {
                         revision: block.revision,
                         animate: ctx.animate,
                         tools_open: ctx.tools_open,
+                        show_addresses: ctx.show_addresses,
                         rows,
                     },
                 );

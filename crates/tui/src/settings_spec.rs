@@ -10,7 +10,8 @@
 
 use harness::approval::ApprovalMode;
 use harness::settings::{
-    ConversationOrder, Density, OpenIn, SidebarVisibility, SidebarWidth, ToolResultView, settings_t,
+    ConversationOrder, Density, LinkAddresses, OpenIn, SidebarVisibility, SidebarWidth,
+    ToolResultView, settings_t,
 };
 
 /// A section of the settings page, in the order the list shows them.
@@ -76,6 +77,8 @@ pub enum SettingKey {
     Animation,
     Density,
     ToolResults,
+    LinkHyperlinks,
+    LinkAddresses,
     Sidebar,
     SidebarWidth,
     ShowContext,
@@ -92,11 +95,13 @@ pub enum SettingKey {
 }
 
 /// Every setting, in the order the page lists them.
-pub const SettingKeys: [SettingKey; 17] = [
+pub const SettingKeys: [SettingKey; 19] = [
     SettingKey::Theme,
     SettingKey::Animation,
     SettingKey::Density,
     SettingKey::ToolResults,
+    SettingKey::LinkHyperlinks,
+    SettingKey::LinkAddresses,
     SettingKey::Sidebar,
     SettingKey::SidebarWidth,
     SettingKey::ShowContext,
@@ -132,7 +137,9 @@ impl SettingKey {
             SettingKey::Theme
             | SettingKey::Animation
             | SettingKey::Density
-            | SettingKey::ToolResults => Section::Appearance,
+            | SettingKey::ToolResults
+            | SettingKey::LinkHyperlinks
+            | SettingKey::LinkAddresses => Section::Appearance,
             SettingKey::Sidebar
             | SettingKey::SidebarWidth
             | SettingKey::ShowContext
@@ -155,6 +162,8 @@ impl SettingKey {
             SettingKey::Animation => "animation",
             SettingKey::Density => "density",
             SettingKey::ToolResults => "tool results",
+            SettingKey::LinkHyperlinks => "terminal hyperlinks",
+            SettingKey::LinkAddresses => "link addresses",
             SettingKey::Sidebar => "sidebar",
             SettingKey::SidebarWidth => "sidebar width",
             SettingKey::ShowContext => "context",
@@ -181,6 +190,12 @@ impl SettingKey {
             SettingKey::Density => "compact drops the blank rows between blocks and sections",
             SettingKey::ToolResults => {
                 "whether a tool's output starts folded; enter or a click still flips one"
+            }
+            SettingKey::LinkHyperlinks => {
+                "link text becomes a terminal hyperlink on terminals that support OSC 8; turn off if your terminal prints stray characters"
+            }
+            SettingKey::LinkAddresses => {
+                "whether the address is always shown after a link's label; hidden shows it only for suspicious or refused links"
             }
             SettingKey::Sidebar => {
                 "auto docks from 100 columns; pinned docks whenever it fits; hidden keeps it a drawer"
@@ -213,9 +228,11 @@ impl SettingKey {
             | SettingKey::ShowRowDetails
             | SettingKey::ConfirmDelete
             | SettingKey::ShowArchived
-            | SettingKey::RestoreTabs => Control::Toggle,
+            | SettingKey::RestoreTabs
+            | SettingKey::LinkHyperlinks => Control::Toggle,
             SettingKey::Density
             | SettingKey::ToolResults
+            | SettingKey::LinkAddresses
             | SettingKey::Sidebar
             | SettingKey::SidebarWidth
             | SettingKey::DefaultApproval
@@ -229,6 +246,7 @@ impl SettingKey {
         match self {
             SettingKey::Density => &["comfortable", "compact"],
             SettingKey::ToolResults => &["folded", "expanded"],
+            SettingKey::LinkAddresses => &["hidden", "inline"],
             SettingKey::Sidebar => &["auto", "pinned", "hidden"],
             SettingKey::SidebarWidth => &["compact", "normal", "wide"],
             SettingKey::DefaultApproval => &["ask", "edit", "full"],
@@ -253,6 +271,10 @@ impl SettingKey {
             SettingKey::ToolResults => match s.tool_results {
                 ToolResultView::Folded => 0,
                 ToolResultView::Expanded => 1,
+            },
+            SettingKey::LinkAddresses => match s.link_addresses {
+                LinkAddresses::Hidden => 0,
+                LinkAddresses::Inline => 1,
             },
             SettingKey::Sidebar => match s.sidebar {
                 SidebarVisibility::Auto => 0,
@@ -292,6 +314,8 @@ impl SettingKey {
             (SettingKey::Density, 1) => s.density = Density::Compact,
             (SettingKey::ToolResults, 0) => s.tool_results = ToolResultView::Folded,
             (SettingKey::ToolResults, 1) => s.tool_results = ToolResultView::Expanded,
+            (SettingKey::LinkAddresses, 0) => s.link_addresses = LinkAddresses::Hidden,
+            (SettingKey::LinkAddresses, 1) => s.link_addresses = LinkAddresses::Inline,
             (SettingKey::Sidebar, 0) => s.sidebar = SidebarVisibility::Auto,
             (SettingKey::Sidebar, 1) => s.sidebar = SidebarVisibility::Pinned,
             (SettingKey::Sidebar, 2) => s.sidebar = SidebarVisibility::Hidden,
@@ -337,6 +361,7 @@ impl SettingKey {
             SettingKey::ConfirmDelete => s.confirm_delete,
             SettingKey::ShowArchived => s.show_archived,
             SettingKey::RestoreTabs => s.restore_tabs,
+            SettingKey::LinkHyperlinks => s.link_hyperlinks,
             _ => return None,
         })
     }
@@ -353,6 +378,7 @@ impl SettingKey {
             SettingKey::ConfirmDelete => &mut s.confirm_delete,
             SettingKey::ShowArchived => &mut s.show_archived,
             SettingKey::RestoreTabs => &mut s.restore_tabs,
+            SettingKey::LinkHyperlinks => &mut s.link_hyperlinks,
             _ => return false,
         };
         *field = on;
@@ -367,6 +393,8 @@ impl SettingKey {
             SettingKey::Animation => s.animation = d.animation,
             SettingKey::Density => s.density = d.density,
             SettingKey::ToolResults => s.tool_results = d.tool_results,
+            SettingKey::LinkHyperlinks => s.link_hyperlinks = d.link_hyperlinks,
+            SettingKey::LinkAddresses => s.link_addresses = d.link_addresses,
             SettingKey::Sidebar => s.sidebar = d.sidebar,
             SettingKey::SidebarWidth => s.sidebar_width = d.sidebar_width,
             SettingKey::ShowContext => s.show_context = d.show_context,

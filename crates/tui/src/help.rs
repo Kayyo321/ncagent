@@ -66,6 +66,18 @@ pub const Keys: &[(&str, &str)] = &[
         "expand or fold the selected tool or attempt",
     ),
     ("navigate: g · G · i", "top · latest · back to the input"),
+    (
+        "navigate: ] · [",
+        "next · previous link of the selected block (its address shows below)",
+    ),
+    (
+        "navigate: enter · y",
+        "on a chosen link: open it (asks first) · copy it",
+    ),
+    (
+        "open link: enter · c · esc",
+        "open in the browser · copy (OSC 52) · cancel (also y · n)",
+    ),
     ("sidebar: j k enter n", "move · open or fold · new chat"),
     ("sidebar: ← →", "fold · unfold a folder"),
     (
@@ -163,6 +175,10 @@ pub const Mouse: &[(&str, &str)] = &[
         "on hover: + sub-folder · ✎ rename · ⇢ move · ✕ delete",
     ),
     ("↓ new chip", "jump to the latest message"),
+    (
+        "link",
+        "hover shows its address below; click asks to open or copy it",
+    ),
     (
         "⚙ settings",
         "bottom right of the sidebar: opens the settings page",

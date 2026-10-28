@@ -264,6 +264,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use harness::approval::ApprovalMode;
+    use harness::settings::LinkAddresses;
 
     use super::*;
 
@@ -396,6 +397,47 @@ mod tests {
         assert!(!loaded.animation);
         assert_eq!(loaded.sidebar, settings_t::default().sidebar);
         assert_eq!(loaded.default_approval, ApprovalMode::Ask);
+    }
+
+    #[test]
+    fn the_link_settings_round_trip_through_the_file() {
+        let scratch = scratch_dir_t::new("link-round-trip");
+        let store = file_settings_store_t::new(scratch.path.clone());
+        let changed = settings_t {
+            link_hyperlinks: false,
+            link_addresses: LinkAddresses::Inline,
+            ..settings_t::default()
+        };
+        ok(store.save(&changed));
+        let text = ok(fs::read_to_string(scratch.settings_file()));
+        assert!(text.contains("\"link_hyperlinks\": false"), "{text}");
+        assert!(text.contains("\"link_addresses\": \"inline\""), "{text}");
+        assert_eq!(ok(store.load()), changed);
+    }
+
+    #[test]
+    fn a_settings_file_without_the_link_fields_loads_the_link_defaults() {
+        let scratch = scratch_dir_t::new("link-old-file");
+        let loaded = ok(load_settings_text(
+            &scratch,
+            r#"{"theme":"ncagent-dark","animation":false,"tool_results":"expanded"}"#,
+        ));
+        assert!(loaded.link_hyperlinks, "hyperlinks stay on");
+        assert_eq!(loaded.link_addresses, LinkAddresses::Hidden);
+        assert!(!loaded.animation, "the fields that are there still load");
+    }
+
+    #[test]
+    fn an_unknown_link_address_mode_is_refused_as_malformed() {
+        let scratch = scratch_dir_t::new("link-unknown");
+        assert!(matches!(
+            load_settings_text(&scratch, r#"{"link_addresses":"sometimes"}"#),
+            Err(SettingsError::Malformed { .. })
+        ));
+        assert!(matches!(
+            load_settings_text(&scratch, r#"{"link_hyperlinks":"yes"}"#),
+            Err(SettingsError::Malformed { .. })
+        ));
     }
 
     #[test]

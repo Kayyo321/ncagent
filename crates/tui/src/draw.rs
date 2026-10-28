@@ -5,7 +5,7 @@
 
 use harness::api::SessionPhase;
 use harness::approval::{ApprovalDecision, ApprovalMode};
-use harness::settings::{Density, ToolResultView};
+use harness::settings::{Density, LinkAddresses, ToolResultView};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
@@ -15,8 +15,10 @@ use crate::app::app_t;
 use crate::banner::chip;
 use crate::canvas::{fill, put_line, put_str, put_str_right, tint};
 use crate::help::help_lines;
+use crate::hyperlink::{link_rect_t, link_runs};
 use crate::input::{Action, Focus, MenuAction, Modal, SelectAction, TabAction, Target};
 use crate::layout::{self, SidebarMode, layout_input_t};
+use crate::link_ui::LinkAction;
 use crate::menu_draw::{draw_delete_dialog, draw_menu};
 use crate::settings_draw::draw_settings_page;
 use crate::settings_page::{PageAction, PageKeys};
@@ -245,6 +247,8 @@ pub fn draw(app: &mut app_t, frame: &mut Frame<'_>) {
     let area = frame.area();
     app.hits.clear();
     app.overlay_areas.clear();
+    app.links.clear();
+    app.covers.clear();
     // The theme of this frame: the setting, or the settings page's preview (D64).
     app.sync_theme();
     let theme = app.theme.clone();
@@ -338,7 +342,19 @@ pub fn draw(app: &mut app_t, frame: &mut Frame<'_>) {
         draw_help(app, buf, lay.help);
     }
     draw_delete_dialog(app, buf, lay.main);
+    crate::link_ui::draw_link_dialog(app, buf, lay.main);
     draw_menu(app, buf, area);
+    // What is drawn over the transcript: links under it are not made hyperlinks (D77).
+    let mut covers = app.overlay_areas.clone();
+    covers.extend([lay.popup, lay.dock, lay.queue]);
+    if app.help_open {
+        covers.push(lay.help);
+    }
+    if lay.sidebar_mode() == SidebarMode::Drawer {
+        covers.push(lay.sidebar);
+    }
+    app.covers
+        .extend(covers.into_iter().filter(|r| r.width > 0 && r.height > 0));
     quantize_buffer(buf, app.options.color);
 }
 
@@ -433,6 +449,7 @@ fn draw_transcript(app: &mut app_t, buf: &mut Buffer, area: Rect, scrollbar: Rec
         logo_start: live.logo_from,
         tools_open,
         gap,
+        show_addresses: app.settings.link_addresses == LinkAddresses::Inline,
     };
     let previous_total = live.scroll.total;
     live.view.prepare(&live.transcript, &ctx);
@@ -482,6 +499,9 @@ fn draw_transcript(app: &mut app_t, buf: &mut Buffer, area: Rect, scrollbar: Rec
     } else {
         None
     };
+    let link_cursor = app.link_cursor;
+    let mut link_cache: std::collections::HashMap<u64, Vec<crate::hyperlink::link_run_t>> =
+        std::collections::HashMap::new();
 
     for r in 0..area.height {
         let g = top.saturating_add(usize::from(r));
@@ -565,6 +585,37 @@ fn draw_transcript(app: &mut app_t, buf: &mut Buffer, area: Rect, scrollbar: Rec
             .clone()
             .unwrap_or(Action::SelectBlockId(block.id));
         app.hits.add(row_rect, action);
+        // Links on this row: a click target each, lit while hovered or chosen (D77).
+        let runs = link_cache
+            .entry(block.id)
+            .or_insert_with(|| link_runs(rows.rows.iter().map(|r| &r.line)));
+        for run in runs.iter().filter(|r| r.row == local) {
+            let x = content_x.saturating_add(run.col);
+            if x >= content_right {
+                continue;
+            }
+            let rect = Rect::new(x, y, run.width.min(content_right - x), 1);
+            let chosen = focus == Focus::Transcript
+                && selected == Some(block.id)
+                && link_cursor == Some((block.id, run.index));
+            let over = hover.is_some_and(|(hx, hy)| rect.contains(Position::new(hx, hy)));
+            if chosen || over {
+                for cx in rect.left()..rect.right() {
+                    if let Some(cell) = buf.cell_mut((cx, y)) {
+                        cell.set_fg(theme.fg);
+                        cell.modifier.insert(Modifier::BOLD | Modifier::UNDERLINED);
+                    }
+                }
+            }
+            app.hits
+                .add(rect, Action::Link(LinkAction::Choose(run.url.clone())));
+            app.links.push(link_rect_t {
+                rect,
+                url: run.url.clone(),
+                block: block.id,
+                index: run.index,
+            });
+        }
     }
 
     // Sticky speaker label when a block's header has scrolled off the top.
@@ -605,6 +656,11 @@ fn draw_transcript(app: &mut app_t, buf: &mut Buffer, area: Rect, scrollbar: Rec
                 Style::new().fg(rail).bg(bg),
             );
             put_line(buf, content_x, y, content_right, label, Style::new().bg(bg));
+            // The label covers the links of the top row.
+            app.links.retain(|l| l.rect.y != y);
+            app.hits.hits.retain(|h| {
+                !(h.rect.y == y && matches!(h.target, Target::Action(Action::Link(_))))
+            });
             put_str_right(
                 buf,
                 content_right,
@@ -978,6 +1034,44 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
         }
     }
     let left_end = x.saturating_add(2);
+    // A link under the pointer, or chosen with the keys: its whole address (D77).
+    if app.modal() == Modal::None
+        && let Some(url) = app.shown_link()
+    {
+        let hint = if app.hovered_link().is_some() {
+            "click to open"
+        } else {
+            "enter open · y copy"
+        };
+        let room = usize::from(right.saturating_sub(left_end))
+            .saturating_sub(str_width(hint) + 4)
+            .max(8);
+        let nx = put_str(
+            buf,
+            left_end,
+            area.y,
+            right,
+            "↗ ",
+            Style::new().fg(theme.link),
+        );
+        let nx = put_str(
+            buf,
+            nx,
+            area.y,
+            right,
+            &crate::links::middle_truncate(&url, room),
+            Style::new().fg(theme.fg),
+        );
+        put_str(
+            buf,
+            nx.saturating_add(2),
+            area.y,
+            right,
+            hint,
+            Style::new().fg(theme.fg_faint),
+        );
+        return;
+    }
 
     let modal = app.modal();
     let busy = app.busy();
@@ -1033,6 +1127,11 @@ fn draw_status(app: &mut app_t, buf: &mut Buffer, area: Rect) {
             hints.push(("enter", "send", Some(Action::QuestionSubmit)));
         }
         (Modal::Help, _) => hints.push(("any key", "close", Some(Action::ToggleHelp))),
+        (Modal::Link, _) => {
+            hints.push(("enter", "open", Some(Action::Link(LinkAction::Open))));
+            hints.push(("c", "copy", Some(Action::Link(LinkAction::Copy))));
+            hints.push(("esc", "cancel", Some(Action::Link(LinkAction::Cancel))));
+        }
         (Modal::None, Focus::Settings) => page_hints(app, &mut hints),
         (Modal::None, Focus::Transcript) => {
             hints.push(("j/k", "select", None));

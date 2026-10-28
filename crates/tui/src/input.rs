@@ -15,6 +15,7 @@ use harness::approval::ApprovalDecision;
 use ratatui::layout::{Position, Rect};
 
 use crate::composer::EditOp;
+use crate::link_ui::LinkAction;
 use crate::settings_page::{PageAction, PageKeys, page_key};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -174,6 +175,8 @@ pub enum Action {
     RunCommand(&'static str),
     /// The settings page (D65).
     Page(PageAction),
+    /// A link in the transcript (D76, D77).
+    Link(LinkAction),
     /// Mouse only: a click on the toast starts its dissolve. Keys: none needed, a toast goes on
     /// its own after its time.
     DismissToast,
@@ -194,6 +197,8 @@ pub enum Modal {
     Move,
     /// The context menu (D61).
     Menu,
+    /// The confirmation before a link opens (D76).
+    Link,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,6 +385,15 @@ pub fn map_key(key: &KeyEvent, ctx: &key_ctx_t) -> Option<Action> {
                 _ => None,
             };
         }
+        Modal::Link => {
+            let link = |l| Some(Action::Link(l));
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('y') if !c => link(LinkAction::Open),
+                KeyCode::Char('c') if !c => link(LinkAction::Copy),
+                KeyCode::Char('n') if !c => link(LinkAction::Cancel),
+                _ => None,
+            };
+        }
         Modal::Move => {
             return match key.code {
                 KeyCode::Down | KeyCode::Char('j') => Some(Action::MoveStep(1)),
@@ -420,6 +434,9 @@ pub fn map_key(key: &KeyEvent, ctx: &key_ctx_t) -> Option<Action> {
             KeyCode::End | KeyCode::Char('G') => Some(Action::JumpLatest),
             KeyCode::Char('i') => Some(Action::SetFocus(Focus::Input)),
             KeyCode::Char('?') => Some(Action::ToggleHelp),
+            KeyCode::Char(']') => Some(Action::Link(LinkAction::Step(1))),
+            KeyCode::Char('[') => Some(Action::Link(LinkAction::Step(-1))),
+            KeyCode::Char('y') if !c => Some(Action::Link(LinkAction::CopyActive)),
             KeyCode::Char(ch) if !c && !alt(key) => Some(Action::TypeInto(ch)),
             _ => None,
         },

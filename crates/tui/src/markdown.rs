@@ -8,6 +8,7 @@
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 
+use crate::links;
 use crate::text::{
     fit, hard_wrap, line_t, sanitize, span_t, spans_width, str_width, truncate, wrap_spans,
 };
@@ -36,7 +37,10 @@ struct md_t<'t> {
     inline: Vec<span_t>,
     styles: Vec<Style>,
     containers: Vec<container_t>,
-    link_urls: Vec<String>,
+    /// Open links and images: the address as written, and where the label's spans start.
+    link_urls: Vec<(String, usize)>,
+    /// Show every accepted address after its label (the `link_addresses` setting, D78).
+    show_addresses: bool,
     code: Option<(String, String)>,
     table: Option<table_t>,
     cell: Option<Vec<span_t>>,
@@ -46,6 +50,11 @@ struct md_t<'t> {
 
 /// Render Markdown to lines no wider than `width` (prefixes included).
 pub fn render(text: &str, width: usize, theme: &theme_t) -> Vec<line_t> {
+    render_with(text, width, theme, false)
+}
+
+/// `render`, choosing whether every accepted link keeps its address after the label (D77).
+pub fn render_with(text: &str, width: usize, theme: &theme_t, show_addresses: bool) -> Vec<line_t> {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
@@ -58,6 +67,7 @@ pub fn render(text: &str, width: usize, theme: &theme_t) -> Vec<line_t> {
         styles: vec![Style::new().fg(theme.fg)],
         containers: Vec::new(),
         link_urls: Vec::new(),
+        show_addresses,
         code: None,
         table: None,
         cell: None,
@@ -319,12 +329,14 @@ impl md_t<'_> {
             Tag::Strikethrough => self.push_style(|s| s.add_modifier(Modifier::CROSSED_OUT)),
             Tag::Superscript | Tag::Subscript => self.push_style(|s| s),
             Tag::Link { dest_url, .. } => {
-                self.link_urls.push(sanitize(&dest_url, false));
+                let start = self.sink_len();
+                self.link_urls.push((dest_url.to_string(), start));
                 let link = self.theme.link;
                 self.push_style(|s| s.fg(link).add_modifier(Modifier::UNDERLINED));
             }
             Tag::Image { dest_url, .. } => {
-                self.link_urls.push(sanitize(&dest_url, false));
+                let start = self.sink_len();
+                self.link_urls.push((dest_url.to_string(), start));
                 let dim = self.theme.fg_dim;
                 self.push_style(|s| s.fg(dim));
                 self.text("[image: ");
@@ -408,19 +420,28 @@ impl md_t<'_> {
             | TagEnd::Subscript => self.pop_style(),
             TagEnd::Link => {
                 self.pop_style();
-                let url = self.link_urls.pop().unwrap_or_default();
-                let label: String = self
-                    .inline
-                    .last()
-                    .map(|s| s.text.clone())
-                    .unwrap_or_default();
-                if !url.is_empty() && label.trim() != url.trim() {
+                let (raw, start) = self.link_urls.pop().unwrap_or_default();
+                let url = sanitize(&raw, false);
+                // A link inside a table cell is laid out by the table, which keeps no links:
+                // it stays plain text with its address shown.
+                let accepted = links::safe_url(&raw).filter(|_| self.cell.is_none());
+                let sink = match self.cell.as_mut() {
+                    Some(cell) => cell,
+                    None => &mut self.inline,
+                };
+                let label: String = sink.iter().skip(start).map(|s| s.text.as_str()).collect();
+                if let Some(target) = &accepted {
+                    for span in sink.iter_mut().skip(start) {
+                        span.link = Some(target.clone());
+                    }
+                }
+                if links::show_suffix(&label, &url, accepted.is_some(), self.show_addresses) {
                     let style = Style::new().fg(self.theme.fg_faint);
                     self.text_styled(&format!(" ({url})"), style);
                 }
             }
             TagEnd::Image => {
-                let url = self.link_urls.pop().unwrap_or_default();
+                let url = sanitize(&self.link_urls.pop().unwrap_or_default().0, false);
                 self.text("]");
                 self.pop_style();
                 if !url.is_empty() {
@@ -433,6 +454,14 @@ impl md_t<'_> {
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
             | TagEnd::MetadataBlock(_) => self.flush_inline(),
+        }
+    }
+
+    /// How many spans the current inline run (or table cell) holds.
+    fn sink_len(&self) -> usize {
+        match &self.cell {
+            Some(cell) => cell.len(),
+            None => self.inline.len(),
         }
     }
 
@@ -623,7 +652,21 @@ mod tests {
     #[test]
     fn inline_code_and_links() {
         let out = lines("use `x` and [docs](https://e.org)", 80);
-        assert_eq!(out, vec!["use  x  and docs (https://e.org)"]);
+        assert_eq!(out, vec!["use  x  and docs"], "the address is in the link");
+        let out = lines("[docs](javascript:alert(1))", 80);
+        assert_eq!(out, vec!["docs (javascript:alert(1))"], "refused: shown");
+        let out = lines("[google.com](https://evil.example)", 80);
+        assert_eq!(
+            out,
+            vec!["google.com (https://evil.example)"],
+            "deceptive: shown"
+        );
+        let out = lines("![a cat](https://e.org/cat.png)", 80);
+        assert_eq!(
+            out,
+            vec!["[image: a cat] (https://e.org/cat.png)"],
+            "images keep it"
+        );
         let out = lines("<https://e.org>", 80);
         assert_eq!(out, vec!["https://e.org"]);
     }

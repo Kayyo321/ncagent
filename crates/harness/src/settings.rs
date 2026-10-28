@@ -87,6 +87,14 @@ pub enum ConversationOrder {
     Title,
 }
 
+/// Whether the address of a link is shown after its label (D77, D78).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkAddresses {
+    Hidden,
+    Inline,
+}
+
 /// The user's settings (D63). Unknown fields in a file are ignored, and a missing field takes its
 /// default, so a file from a later or earlier build still loads.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +112,10 @@ pub struct settings_t {
     pub show_model: bool,
     pub show_row_details: bool,
     pub tool_results: ToolResultView,
+    /// Write link text as terminal hyperlinks (OSC 8) where the terminal may show them (D77).
+    pub link_hyperlinks: bool,
+    /// Whether every link keeps its address after its label (D78).
+    pub link_addresses: LinkAddresses,
     /// The approval mode of a new conversation. `full` is refused (D15).
     pub default_approval: ApprovalMode,
     pub confirm_delete: bool,
@@ -131,6 +143,8 @@ impl Default for settings_t {
             show_model: true,
             show_row_details: true,
             tool_results: ToolResultView::Folded,
+            link_hyperlinks: true,
+            link_addresses: LinkAddresses::Hidden,
             default_approval: ApprovalMode::Ask,
             confirm_delete: true,
             open_in: OpenIn::NewTab,
@@ -523,11 +537,38 @@ mod tests {
         assert_eq!(settings.sidebar, SidebarVisibility::Auto);
         assert_eq!(settings.default_approval, ApprovalMode::Ask);
         assert_eq!(settings.tool_results, ToolResultView::Folded);
+        assert!(
+            settings.link_hyperlinks,
+            "links are terminal hyperlinks by default"
+        );
+        assert_eq!(settings.link_addresses, LinkAddresses::Hidden);
         assert_eq!(settings.open_in, OpenIn::NewTab);
         assert_eq!(settings.conversation_order, ConversationOrder::Recent);
         assert!(settings.open_tabs.is_empty());
         assert_eq!(settings.active_tab, None);
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn the_link_settings_read_and_write_their_snake_case_values() {
+        let changed = settings_t {
+            link_hyperlinks: false,
+            link_addresses: LinkAddresses::Inline,
+            ..settings_t::default()
+        };
+        let text = ok(serde_json::to_string(&changed));
+        assert!(text.contains("\"link_hyperlinks\":false"), "{text}");
+        assert!(text.contains("\"link_addresses\":\"inline\""), "{text}");
+        let back: settings_t = ok(serde_json::from_str(&text));
+        assert_eq!(back, changed);
+
+        let old: settings_t = ok(serde_json::from_str(r#"{"animation":false}"#));
+        assert!(old.link_hyperlinks);
+        assert_eq!(old.link_addresses, LinkAddresses::Hidden);
+
+        let unknown: Result<settings_t, _> =
+            serde_json::from_str(r#"{"link_addresses":"sometimes"}"#);
+        assert!(unknown.is_err(), "an unknown address mode is refused");
     }
 
     #[test]
